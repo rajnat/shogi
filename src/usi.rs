@@ -12,8 +12,8 @@
 use std::io::{self, BufRead, Write};
 
 use crate::board::Board;
-use crate::movegen::generate_legal_moves;
 use crate::moves::make_move_full;
+use crate::search::minimax;
 use crate::types::{Color, Move, PieceType};
 
 const ENGINE_NAME: &str = "ShogiCore";
@@ -171,17 +171,19 @@ fn time_budget_ms(params: &GoParams, color: Color) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// Move selection (placeholder until M3 adds real search)
+// Move selection
 // ---------------------------------------------------------------------------
 
-/// Returns the best move for the current position.
+/// Fixed search depth for M3-01 plain minimax.
+/// Depth 3 gives ~25k nodes from startpos and completes in well under a second.
+const MINIMAX_DEPTH: u32 = 3;
+
+/// Returns the best move found by minimax search within the time budget.
 ///
-/// For M2 this is simply the first legal move; M3 will replace this with
-/// iterative-deepening alpha-beta within the time budget.
+/// M3-01: plain negamax at fixed depth 3.
+/// M3-04 will replace this with iterative deepening that respects budget_ms.
 pub fn select_move(board: &mut Board, _budget_ms: u64) -> Option<Move> {
-    let mut moves = Vec::with_capacity(128);
-    generate_legal_moves(board, &mut moves);
-    moves.into_iter().next()
+    minimax(board, MINIMAX_DEPTH).map(|(mv, _)| mv)
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +266,7 @@ pub fn run_usi_loop() {
 mod tests {
     use super::*;
     use crate::board::Board;
+    use crate::movegen::generate_legal_moves;
 
     #[test]
     fn test_parse_usi_square() {
