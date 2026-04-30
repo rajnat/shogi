@@ -1,6 +1,7 @@
-/// Classical search/
-///
-/// Later steps will add move ordering, iterative deepening, and a TT.
+/// Classical search
+use std::io::{self, Write};
+use std::time::{Duration, Instant};
+
 use crate::board::Board;
 use crate::movegen::generate_legal_moves;
 use crate::moves::{make_move_full, unmake_move_full};
@@ -194,19 +195,32 @@ pub fn minimax(board: &mut Board, depth: u32) -> Option<(Move, i32)> {
 // Alpha-beta
 // ---------------------------------------------------------------------------
 
-/// Tracks per-search statistics.  Carried through `Searcher` so
-/// iterative deepening can also read elapsed time from the same place.
+/// Tracks per-search statistics.
 #[derive(Debug, Default, Clone)]
 pub struct SearchStats {
     pub nodes: u64,
 }
 
-/// The search engine.  Owns mutable state (stats, and later: TT, killer moves)
-/// that would be awkward to thread through bare recursive functions.
+/// Result returned by `Searcher::search_timed` after iterative deepening.
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    pub best_move: Move,
+    pub score: i32,
+    /// Deepest fully-completed iteration.
+    pub depth: u32,
+    pub nodes: u64,
+    pub elapsed_ms: u64,
+}
+
+/// The search engine.  Owns mutable state that would be awkward to thread
+/// through bare recursive functions: stats, move-ordering flag, and the
+/// PV move carried across iterative-deepening iterations.
 pub struct Searcher {
     pub stats: SearchStats,
     /// When true, moves are scored and sorted before each alpha-beta expansion.
     pub use_move_ordering: bool,
+    /// Best move from the previous iteration; seeded into root move ordering.
+    pv_move: Option<Move>,
 }
 
 impl Searcher {
@@ -214,6 +228,7 @@ impl Searcher {
         Searcher {
             stats: SearchStats::default(),
             use_move_ordering: true,
+            pv_move: None,
         }
     }
 
@@ -223,6 +238,7 @@ impl Searcher {
         Searcher {
             stats: SearchStats::default(),
             use_move_ordering: false,
+            pv_move: None,
         }
     }
 
@@ -265,8 +281,14 @@ impl Searcher {
         alpha
     }
 
-    /// Root search: returns the best move and its score at the given depth.
-    /// Returns `None` only if the side to move has no legal moves (mated).
+    /// Root search at a fixed depth.  Returns the best move and its score, or
+    /// `None` if there are no legal moves (side to move is mated).
+    ///
+    /// When `self.pv_move` is set (from a previous iteration), that move is
+    /// tried first at the root before the regular ordering is applied.  This
+    /// is the key mechanism that makes iterative deepening effective: earlier
+    /// iterations supply a good first move that triggers an early beta cutoff
+    /// at the root, narrowing the window for subsequent moves.
     pub fn search(&mut self, board: &mut Board, depth: u32) -> Option<(Move, i32)> {
         let mut moves = Vec::with_capacity(128);
         generate_legal_moves(board, &mut moves);
@@ -279,8 +301,21 @@ impl Searcher {
             return Some((moves[0], eval(board)));
         }
 
+        // PV move ordering: put the previous-iteration best move first so it
+        // gets searched before the heuristic-ordered remainder.
+        let rest_start = if let Some(pv) = self.pv_move {
+            if let Some(pos) = moves.iter().position(|&m| m == pv) {
+                moves.swap(0, pos);
+                1 // regular ordering starts after slot 0
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
         if self.use_move_ordering {
-            order_moves(&mut moves, board);
+            order_moves(&mut moves[rest_start..], board);
         }
 
         let mut best_move = moves[0];
@@ -299,6 +334,65 @@ impl Searcher {
         }
 
         Some((best_move, alpha))
+    }
+
+    /// Iterative deepening search with a soft time limit.
+    ///
+    /// Runs `search` at depth 1, 2, 3, … and stops after the first
+    /// completed depth that pushes elapsed time past `budget_ms`.  The best
+    /// move from each completed depth seeds the root ordering for the next
+    /// (PV move ordering).
+    ///
+    /// Prints a USI `info` line to stdout after every completed depth so a
+    /// connected GUI can display search progress in real time.
+    ///
+    /// Returns `None` only if the position has no legal moves at all.
+    pub fn search_timed(&mut self, board: &mut Board, budget_ms: u64) -> Option<SearchResult> {
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(budget_ms);
+
+        // Reset accumulated state from any previous call.
+        self.stats = SearchStats::default();
+        self.pv_move = None;
+
+        let mut best: Option<SearchResult> = None;
+
+        for depth in 1..=64u32 {
+            let Some((mv, score)) = self.search(board, depth) else {
+                break; // position is already mated
+            };
+
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            self.pv_move = Some(mv); // carry forward for next iteration
+
+            // Emit a USI info line for this depth.
+            println!(
+                "info depth {depth} score cp {score} nodes {} time {elapsed_ms} pv {}",
+                self.stats.nodes,
+                mv.to_usi_string()
+            );
+            io::stdout().flush().ok();
+
+            best = Some(SearchResult {
+                best_move: mv,
+                score,
+                depth,
+                nodes: self.stats.nodes,
+                elapsed_ms,
+            });
+
+            // A forced mate: searching deeper won't change the outcome.
+            if score.abs() >= MATE_SCORE {
+                break;
+            }
+
+            // Soft stop: complete the current depth, then check.
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+
+        best
     }
 }
 
@@ -575,6 +669,94 @@ mod tests {
         assert!(
             ab_nodes < negamax_nodes,
             "alpha-beta ({ab_nodes} nodes) should visit fewer nodes than negamax ({negamax_nodes})"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // iterative deepening
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_search_timed_returns_move() {
+        let mut board = Board::startpos();
+        let result = Searcher::new().search_timed(&mut board, 500);
+        assert!(result.is_some(), "search_timed must return a move from startpos");
+    }
+
+    #[test]
+    fn test_search_timed_reaches_depth_gt_1() {
+        // With 500 ms budget, ID must complete at least depth 2 from startpos.
+        let mut board = Board::startpos();
+        let result = Searcher::new().search_timed(&mut board, 500).unwrap();
+        assert!(
+            result.depth >= 2,
+            "expected depth ≥ 2 within 500 ms, got {}",
+            result.depth
+        );
+    }
+
+    #[test]
+    fn test_search_timed_board_unchanged() {
+        let before = Board::startpos();
+        let mut board = before.clone();
+        Searcher::new().search_timed(&mut board, 200);
+        assert_eq!(
+            board.to_sfen(),
+            before.to_sfen(),
+            "search_timed must leave the board unmodified"
+        );
+    }
+
+    #[test]
+    fn test_search_timed_returns_legal_move() {
+        let mut board = Board::startpos();
+        let result = Searcher::new().search_timed(&mut board, 200).unwrap();
+        let mut legal = Vec::new();
+        generate_legal_moves(&mut board, &mut legal);
+        assert!(
+            legal.contains(&result.best_move),
+            "search_timed returned an illegal move: {}",
+            result.best_move.to_usi_string()
+        );
+    }
+
+    #[test]
+    fn test_search_timed_deeper_with_more_time() {
+        // A generous budget should reach a greater depth than a tight one.
+        let mut board = Board::startpos();
+        let shallow = Searcher::new().search_timed(&mut board, 1).unwrap();
+        let deep = Searcher::new().search_timed(&mut board, 2_000).unwrap();
+        assert!(
+            deep.depth >= shallow.depth,
+            "more time should reach equal or greater depth"
+        );
+    }
+
+    #[test]
+    fn test_pv_move_ordering_reduces_nodes() {
+        // When the root PV move is pre-seeded, the search should visit fewer
+        // or equal nodes than a fresh search at the same depth.
+        let mut board = Board::startpos();
+
+        // Depth-2 search to get a good pv move
+        let mut seeded = Searcher::new();
+        seeded.search(&mut board, 2);
+        let pv = seeded.pv_move;
+
+        // Fresh search at depth 3
+        let mut fresh = Searcher::new();
+        fresh.search(&mut board, 3);
+        let fresh_nodes = fresh.stats.nodes;
+
+        // Seeded search at depth 3
+        let mut with_pv = Searcher::new();
+        with_pv.pv_move = pv;
+        with_pv.search(&mut board, 3);
+        let pv_nodes = with_pv.stats.nodes;
+
+        assert!(
+            pv_nodes <= fresh_nodes,
+            "PV-seeded search ({pv_nodes}) should visit ≤ nodes as fresh ({fresh_nodes})"
         );
     }
 }

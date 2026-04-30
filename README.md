@@ -169,3 +169,5 @@ depth 5 → 19 861 490
 
 ## References
 
+https://www.mastersofgames.com/rules/shogi-rules.htm
+https://www.chessprogramming.org/Shogi

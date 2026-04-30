@@ -9,7 +9,7 @@
 ///   GUI → position …   (engine sets internal board state, no response)
 ///   GUI → go …         engine → bestmove <move>
 ///   GUI → quit         (engine exits)
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Write as _};
 
 use crate::board::Board;
 use crate::moves::make_move_full;
@@ -174,25 +174,33 @@ fn time_budget_ms(params: &GoParams, color: Color) -> u64 {
 // Move selection
 // ---------------------------------------------------------------------------
 
-/// Fixed search depth for the current search implementation.
-/// replace this with iterative deepening that respects budget_ms.
-const SEARCH_DEPTH: u32 = 3;
-
-/// Returns the best move found by alpha-beta search within the time budget.
-pub fn select_move(board: &mut Board, _budget_ms: u64) -> Option<Move> {
-    Searcher::new().search(board, SEARCH_DEPTH).map(|(mv, _)| mv)
+/// Returns the best move found by iterative-deepening alpha-beta within
+/// the given time budget.  Info lines are printed to stdout by `search_timed`.
+pub fn select_move(board: &mut Board, budget_ms: u64) -> Option<Move> {
+    Searcher::new()
+        .search_timed(board, budget_ms)
+        .map(|r| r.best_move)
 }
 
 // ---------------------------------------------------------------------------
 // Main USI loop
 // ---------------------------------------------------------------------------
 
+/// Flush stdout.  Called after every response so a GUI connected via pipe
+/// (which is full-buffered by default) sees output immediately.
+#[inline]
+fn flush() {
+    io::stdout().flush().ok();
+}
+
 pub fn run_usi_loop() {
     let stdin = io::stdin();
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-
     let mut board = Board::startpos();
+
+    // We do NOT hold a persistent stdout lock here: `search_timed` prints
+    // `info` lines via `println!` during the search, and those calls acquire
+    // and release the stdout lock internally.  A persistent lock would cause
+    // a deadlock the moment search tries to print its first info line.
 
     for line in stdin.lock().lines() {
         let line = match line {
@@ -207,16 +215,16 @@ pub fn run_usi_loop() {
         let tokens: Vec<&str> = line.split_whitespace().collect();
         match tokens[0] {
             "usi" => {
-                writeln!(out, "id name {ENGINE_NAME}").ok();
-                writeln!(out, "id author {ENGINE_AUTHOR}").ok();
-                writeln!(out, "usiok").ok();
-                out.flush().ok();
+                println!("id name {ENGINE_NAME}");
+                println!("id author {ENGINE_AUTHOR}");
+                println!("usiok");
+                flush();
             }
 
             "isready" => {
                 // Attack tables initialise lazily on first generate_legal_moves call.
-                writeln!(out, "readyok").ok();
-                out.flush().ok();
+                println!("readyok");
+                flush();
             }
 
             "usinewgame" => {
@@ -231,12 +239,13 @@ pub fn run_usi_loop() {
                 let params = parse_go(&tokens[1..]);
                 let budget = time_budget_ms(&params, board.side_to_move);
 
+                // search_timed prints info lines; we just need the final move.
                 let response = select_move(&mut board, budget)
                     .map(|mv| mv.to_usi_string())
                     .unwrap_or_else(|| "resign".to_string());
 
-                writeln!(out, "bestmove {response}").ok();
-                out.flush().ok();
+                println!("bestmove {response}");
+                flush();
             }
 
             // stop / ponderhit are no-ops until background search is added
