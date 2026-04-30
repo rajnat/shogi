@@ -1,0 +1,19 @@
+[package]
+name = "shogi-core"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "shogi"
+path = "src/main.rs"
+
+[dependencies]
+rand = "0.8"
+rayon = "1"
+clap = { version = "4", features = ["derive"] }
+lazy_static = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
