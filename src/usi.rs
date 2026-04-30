@@ -13,7 +13,7 @@ use std::io::{self, BufRead, Write};
 
 use crate::board::Board;
 use crate::moves::make_move_full;
-use crate::search::minimax;
+use crate::search::Searcher;
 use crate::types::{Color, Move, PieceType};
 
 const ENGINE_NAME: &str = "ShogiCore";
@@ -174,16 +174,13 @@ fn time_budget_ms(params: &GoParams, color: Color) -> u64 {
 // Move selection
 // ---------------------------------------------------------------------------
 
-/// Fixed search depth for M3-01 plain minimax.
-/// Depth 3 gives ~25k nodes from startpos and completes in well under a second.
-const MINIMAX_DEPTH: u32 = 3;
+/// Fixed search depth for the current search implementation.
+/// replace this with iterative deepening that respects budget_ms.
+const SEARCH_DEPTH: u32 = 3;
 
-/// Returns the best move found by minimax search within the time budget.
-///
-/// M3-01: plain negamax at fixed depth 3.
-/// M3-04 will replace this with iterative deepening that respects budget_ms.
+/// Returns the best move found by alpha-beta search within the time budget.
 pub fn select_move(board: &mut Board, _budget_ms: u64) -> Option<Move> {
-    minimax(board, MINIMAX_DEPTH).map(|(mv, _)| mv)
+    Searcher::new().search(board, SEARCH_DEPTH).map(|(mv, _)| mv)
 }
 
 // ---------------------------------------------------------------------------
