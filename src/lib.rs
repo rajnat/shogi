@@ -10,3 +10,4 @@ pub mod tt;
 pub mod eval;
 pub mod search;
 pub mod usi;
+pub mod mcts;
