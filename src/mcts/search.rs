@@ -1,6 +1,7 @@
 /// MCTS search phases: selection, expansion, evaluation, backpropagation.
 use rand::Rng;
 use rand::seq::SliceRandom;
+use rand_distr::{Distribution, Gamma};
 use crate::board::Board;
 use crate::movegen::generate_legal_moves;
 use crate::moves::{make_move_full, unmake_move_full, UndoState};
@@ -148,10 +149,54 @@ pub fn backprop(arena: &mut Arena, leaf: NodeIdx, value: f32) {
 }
 
 // ---------------------------------------------------------------------------
+// Dirichlet noise
+// ---------------------------------------------------------------------------
+
+/// Mix Dirichlet(α, …, α) noise into the prior probabilities of `root`'s
+/// children, encouraging exploration during self-play.
+///
+/// Sampling recipe: draw n independent Gamma(α, 1) values, normalize to
+/// sum 1 to obtain η ~ Dirichlet(α, …, α), then blend:
+///   P'(a) = (1 − ε) · P(a) + ε · η(a)
+///
+/// Must be called **after** the root has been expanded.
+/// Has no effect if the root has no children.
+pub fn add_dirichlet_noise<R: Rng>(
+    arena: &mut Arena,
+    root: NodeIdx,
+    alpha: f32,
+    epsilon: f32,
+    rng: &mut R,
+) {
+    let n = arena.get(root).children.len();
+    if n == 0 {
+        return;
+    }
+
+    let gamma = Gamma::new(alpha as f64, 1.0).expect("dirichlet_alpha must be > 0");
+    let mut noise: Vec<f32> = (0..n).map(|_| gamma.sample(rng) as f32).collect();
+    let sum: f32 = noise.iter().sum();
+    if sum > 0.0 {
+        for v in &mut noise {
+            *v /= sum;
+        }
+    }
+
+    let children: Vec<NodeIdx> = arena.get(root).children.clone();
+    for (&child_idx, &eta) in children.iter().zip(noise.iter()) {
+        let child = arena.get_mut(child_idx);
+        child.prior = (1.0 - epsilon) * child.prior + epsilon * eta;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Simulation loop
 // ---------------------------------------------------------------------------
 
 /// Run `num_simulations` MCTS iterations from `board` and return the best move.
+///
+/// The root is expanded once before the loop so that Dirichlet noise (when
+/// enabled) can be applied to all root children before any simulation begins.
 ///
 /// Each iteration:
 ///   1. **Select** — descend via PUCT to a leaf, applying moves to `board`.
@@ -172,6 +217,15 @@ pub fn mcts_search<R: Rng>(
 ) -> Option<Move> {
     arena.clear();
     let root = arena.alloc(Node::new(None, 1.0, NO_PARENT));
+
+    // Pre-expand root so noise can be applied before any simulation.
+    if !expand(arena, root, board) {
+        return None; // terminal at root
+    }
+
+    if config.dirichlet_noise {
+        add_dirichlet_noise(arena, root, config.dirichlet_alpha, config.dirichlet_epsilon, rng);
+    }
 
     for _ in 0..num_simulations {
         // 1. Selection
@@ -551,6 +605,126 @@ mod tests {
 
         mcts_search(&mut arena, &mut board, 100, &MctsConfig::default(), &mut rng);
         assert_eq!(arena.get(arena.root()).visit_count, 100);
+    }
+
+    // --- Dirichlet noise tests ---
+
+    #[test]
+    fn test_dirichlet_noise_changes_priors() {
+        let mut board = Board::startpos();
+        let mut arena = Arena::new(64);
+        let root = arena.alloc(Node::new(None, 1.0, NO_PARENT));
+        expand(&mut arena, root, &mut board);
+
+        let prior_before: Vec<f32> = arena
+            .get(root)
+            .children
+            .iter()
+            .map(|&i| arena.get(i).prior)
+            .collect();
+
+        let mut rng = seeded_rng(7);
+        add_dirichlet_noise(&mut arena, root, 0.15, 0.25, &mut rng);
+
+        let prior_after: Vec<f32> = arena
+            .get(root)
+            .children
+            .iter()
+            .map(|&i| arena.get(i).prior)
+            .collect();
+
+        // At least one prior must have changed.
+        let any_changed = prior_before
+            .iter()
+            .zip(prior_after.iter())
+            .any(|(a, b)| (a - b).abs() > 1e-6);
+        assert!(any_changed, "Dirichlet noise must alter at least one prior");
+    }
+
+    #[test]
+    fn test_dirichlet_noise_priors_sum_to_one() {
+        let mut board = Board::startpos();
+        let mut arena = Arena::new(64);
+        let root = arena.alloc(Node::new(None, 1.0, NO_PARENT));
+        expand(&mut arena, root, &mut board);
+
+        let mut rng = seeded_rng(8);
+        add_dirichlet_noise(&mut arena, root, 0.15, 0.25, &mut rng);
+
+        let sum: f32 = arena
+            .get(root)
+            .children
+            .iter()
+            .map(|&i| arena.get(i).prior)
+            .sum();
+        assert!((sum - 1.0).abs() < 1e-4, "priors must still sum to ~1 after noise; got {sum}");
+    }
+
+    #[test]
+    fn test_dirichlet_noise_priors_all_positive() {
+        let mut board = Board::startpos();
+        let mut arena = Arena::new(64);
+        let root = arena.alloc(Node::new(None, 1.0, NO_PARENT));
+        expand(&mut arena, root, &mut board);
+
+        let mut rng = seeded_rng(9);
+        add_dirichlet_noise(&mut arena, root, 0.15, 0.25, &mut rng);
+
+        for &child_idx in &arena.get(root).children.clone() {
+            let p = arena.get(child_idx).prior;
+            assert!(p >= 0.0, "priors must stay non-negative after noise; got {p}");
+        }
+    }
+
+    #[test]
+    fn test_dirichlet_noise_no_effect_on_empty_root() {
+        // Root with no children: noise should be a no-op.
+        let mut arena = Arena::new(8);
+        let root = arena.alloc(Node::new(None, 1.0, NO_PARENT));
+        let mut rng = seeded_rng(10);
+        // Must not panic.
+        add_dirichlet_noise(&mut arena, root, 0.15, 0.25, &mut rng);
+        assert!(arena.get(root).children.is_empty());
+    }
+
+    #[test]
+    fn test_mcts_noise_disabled_by_default() {
+        // With dirichlet_noise = false (default), priors at root children
+        // must remain uniform (1/N) after search.
+        let mut board = Board::startpos();
+        let mut arena = Arena::new(4096);
+        let mut rng = seeded_rng(11);
+        let config = MctsConfig::default();
+        assert!(!config.dirichlet_noise);
+
+        mcts_search(&mut arena, &mut board, 10, &config, &mut rng);
+
+        let expected = 1.0 / 30.0_f32;
+        for &child_idx in &arena.get(arena.root()).children.clone() {
+            let p = arena.get(child_idx).prior;
+            assert!((p - expected).abs() < 1e-6, "prior should be uniform; got {p}");
+        }
+    }
+
+    #[test]
+    fn test_mcts_noise_enabled_changes_root_priors() {
+        let mut board = Board::startpos();
+        let mut arena = Arena::new(4096);
+        let mut rng = seeded_rng(12);
+        let config = MctsConfig {
+            dirichlet_noise: true,
+            ..MctsConfig::default()
+        };
+
+        mcts_search(&mut arena, &mut board, 10, &config, &mut rng);
+
+        let uniform = 1.0 / 30.0_f32;
+        let any_changed = arena
+            .get(arena.root())
+            .children
+            .iter()
+            .any(|&i| (arena.get(i).prior - uniform).abs() > 1e-6);
+        assert!(any_changed, "noise=true must change at least one root prior");
     }
 
     /// Quick sanity check — not part of CI.

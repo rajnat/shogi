@@ -1,7 +1,4 @@
 /// Tunable parameters for MCTS search.
-///
-/// Passed to `mcts_search`; fields will grow as M4-03 progresses
-/// (Dirichlet noise, temperature).
 #[derive(Debug, Clone)]
 pub struct MctsConfig {
     /// Exploration constant in the PUCT formula.
@@ -14,6 +11,21 @@ pub struct MctsConfig {
     /// Rollouts that reach this depth without a terminal are scored as draws.
     /// Default: 200.
     pub rollout_depth: usize,
+
+    /// Dirichlet concentration parameter α for root noise.
+    /// Each root child receives noise drawn from Dirichlet(α, …, α).
+    /// AlphaZero used 0.3 for chess; 0.15 is a common starting point.
+    /// Default: 0.15.
+    pub dirichlet_alpha: f32,
+
+    /// Fraction of Dirichlet noise mixed into root priors: P' = (1−ε)·P + ε·η.
+    /// AlphaZero used 0.25. Default: 0.25.
+    pub dirichlet_epsilon: f32,
+
+    /// Enable Dirichlet noise injection at the root.
+    /// Should be `true` during self-play, `false` for analysis/search.
+    /// Default: false.
+    pub dirichlet_noise: bool,
 }
 
 impl Default for MctsConfig {
@@ -21,13 +33,16 @@ impl Default for MctsConfig {
         MctsConfig {
             c_puct: 1.0,
             rollout_depth: 200,
+            dirichlet_alpha: 0.15,
+            dirichlet_epsilon: 0.25,
+            dirichlet_noise: false,
         }
     }
 }
 
 impl MctsConfig {
     pub fn new(c_puct: f32, rollout_depth: usize) -> Self {
-        MctsConfig { c_puct, rollout_depth }
+        MctsConfig { c_puct, rollout_depth, ..MctsConfig::default() }
     }
 }
 
@@ -44,6 +59,9 @@ mod tests {
         let cfg = MctsConfig::default();
         assert!((cfg.c_puct - 1.0).abs() < 1e-6);
         assert_eq!(cfg.rollout_depth, 200);
+        assert!((cfg.dirichlet_alpha - 0.15).abs() < 1e-6);
+        assert!((cfg.dirichlet_epsilon - 0.25).abs() < 1e-6);
+        assert!(!cfg.dirichlet_noise);
     }
 
     #[test]
@@ -51,6 +69,21 @@ mod tests {
         let cfg = MctsConfig::new(2.5, 100);
         assert!((cfg.c_puct - 2.5).abs() < 1e-6);
         assert_eq!(cfg.rollout_depth, 100);
+        // new() only sets c_puct and rollout_depth; rest default.
+        assert!(!cfg.dirichlet_noise);
+    }
+
+    #[test]
+    fn test_dirichlet_fields_via_struct_literal() {
+        let cfg = MctsConfig {
+            dirichlet_alpha: 0.3,
+            dirichlet_epsilon: 0.1,
+            dirichlet_noise: true,
+            ..MctsConfig::default()
+        };
+        assert!((cfg.dirichlet_alpha - 0.3).abs() < 1e-6);
+        assert!((cfg.dirichlet_epsilon - 0.1).abs() < 1e-6);
+        assert!(cfg.dirichlet_noise);
     }
 
     #[test]
