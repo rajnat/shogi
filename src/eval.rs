@@ -4,7 +4,7 @@
 /// widely cited reference for computer-Shogi piece values.  All values are
 /// in centipawns (pawn = 100).
 use crate::board::Board;
-use crate::types::{rank_of, Square};
+use crate::types::{add_step, rank_of, PieceType, Square};
 
 // ---------------------------------------------------------------------------
 // Per-piece named constants
@@ -94,6 +94,69 @@ pub const PROMOTION_GAIN: [i32; 7] = [
 // Static evaluation
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// King safety
+// ---------------------------------------------------------------------------
+
+// Tuning knobs — kept as named constants so they're easy to adjust.
+const SHIELD_OWN: i32 = 10;   // friendly piece in king's 3×3 neighbourhood
+const SHIELD_GOLD: i32 = 8;   // extra for gold / gold-equivalent defenders
+const SHIELD_SILVER: i32 = 4; // extra for silver
+const EXPOSED_SQ: i32 = -12;  // penalty for each empty neighbour square
+
+/// Bitboard of gold-equivalent pieces (Gold + all four promoted minors, which
+/// move like Gold) for `color_idx`.
+#[inline]
+fn gold_like_bb(board: &Board, color_idx: usize) -> crate::bitboard::Bitboard {
+    board.pieces[color_idx][PieceType::Gold.index()]
+        | board.pieces[color_idx][PieceType::ProPawn.index()]
+        | board.pieces[color_idx][PieceType::ProLance.index()]
+        | board.pieces[color_idx][PieceType::ProKnight.index()]
+        | board.pieces[color_idx][PieceType::ProSilver.index()]
+}
+
+/// King-safety score for one side (always positive = safer king).
+/// Scans the 3×3 neighbourhood of the king:
+///   • friendly piece present  → +SHIELD_OWN (+ extra for gold/silver type)
+///   • square empty or enemy   → EXPOSED_SQ
+fn king_safety(board: &Board, color_idx: usize) -> i32 {
+    let king_bb = board.pieces[color_idx][PieceType::King.index()];
+    if king_bb.is_empty() {
+        return 0;
+    }
+    let king_sq = king_bb.lsb();
+    let own = board.color_bb[color_idx];
+    let gold = gold_like_bb(board, color_idx);
+    let silver = board.pieces[color_idx][PieceType::Silver.index()];
+
+    let mut score = 0i32;
+    for df in [-1i8, 0, 1] {
+        for dr in [-1i8, 0, 1] {
+            if df == 0 && dr == 0 {
+                continue;
+            }
+            let Some(nsq) = add_step(king_sq, df, dr) else {
+                continue;
+            };
+            if own.contains(nsq) {
+                score += SHIELD_OWN;
+                if gold.contains(nsq) {
+                    score += SHIELD_GOLD;
+                } else if silver.contains(nsq) {
+                    score += SHIELD_SILVER;
+                }
+            } else {
+                score += EXPOSED_SQ;
+            }
+        }
+    }
+    score
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 /// Returns the advancement index (0 = own back rank, 8 = deepest enemy) for
 /// a piece belonging to the given side.
 #[inline]
@@ -135,6 +198,10 @@ pub fn eval(board: &Board) -> i32 {
         score += board.hand[stm][pt_idx] as i32 * val;
         score -= board.hand[opp][pt_idx] as i32 * val;
     }
+
+    // King safety
+    score += king_safety(board, stm);
+    score -= king_safety(board, opp);
 
     score
 }
@@ -278,5 +345,62 @@ mod tests {
         assert_eq!(adv_idx(square(0, 8), false), 8);
         // White piece at rank_idx 4 (midfield) → adv_idx 4
         assert_eq!(adv_idx(square(4, 4), false), 4);
+    }
+
+    // --- King safety tests ---
+
+    #[test]
+    fn test_king_safety_startpos_symmetric() {
+        // Startpos is perfectly symmetric; king_safety(Black) == king_safety(White)
+        // so the net contribution to eval is zero.
+        let board = Board::startpos();
+        let ks_black = king_safety(&board, 0);
+        let ks_white = king_safety(&board, 1);
+        assert_eq!(ks_black, ks_white,
+            "startpos king safety must be symmetric: black={ks_black} white={ks_white}");
+    }
+
+    #[test]
+    fn test_king_safety_shielded_beats_exposed() {
+        // A king at the back rank with two golds beside it should score higher
+        // than a bare king alone in the middle of the board.
+        //
+        // shielded: "k8/9/9/9/9/9/9/9/GKG6 b - 1"
+        //   Black king at (file 8, rank 9) = file_idx 1, rank_idx 8
+        //   Golds at file 9 and file 7, rank 9
+        // bare:     "k8/9/9/9/4K4/9/9/9/9 b - 1"
+        //   Black king alone at rank 5 (rank_idx 4)
+        let shielded = Board::from_sfen("k8/9/9/9/9/9/9/9/GKG6 b - 1").unwrap();
+        let bare     = Board::from_sfen("k8/9/9/9/4K4/9/9/9/9 b - 1").unwrap();
+        assert!(king_safety(&shielded, 0) > king_safety(&bare, 0),
+            "shielded king must score better than exposed king");
+    }
+
+    #[test]
+    fn test_king_safety_gold_beats_silver() {
+        // Gold-like defenders score higher than silver defenders.
+        let with_gold   = Board::from_sfen("k8/9/9/9/9/9/9/9/GK7 b - 1").unwrap();
+        let with_silver = Board::from_sfen("k8/9/9/9/9/9/9/9/SK7 b - 1").unwrap();
+        assert!(king_safety(&with_gold, 0) > king_safety(&with_silver, 0),
+            "gold defender must outscore silver defender");
+    }
+
+    #[test]
+    fn test_eval_startpos_still_zero_with_king_safety() {
+        // Full eval (material + PST + king safety) on startpos must be zero.
+        let board = Board::startpos();
+        assert_eq!(eval(&board), 0, "startpos eval must remain zero");
+    }
+
+    #[test]
+    fn test_eval_symmetric_flip_with_king_safety() {
+        // eval(pos, stm=A) == -eval(pos, stm=B) must hold with king safety.
+        let mut board = Board::startpos();
+        board.hand[0][PieceType::Rook.index()] += 1;
+        let score_black = eval(&board);
+        board.side_to_move = board.side_to_move.opponent();
+        let score_white = eval(&board);
+        assert_eq!(score_black, -score_white,
+            "flipping side_to_move must negate the score");
     }
 }
