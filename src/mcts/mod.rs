@@ -129,11 +129,14 @@ impl Arena {
     /// Uses the AlphaZero PUCT formula:
     ///
     /// ```text
-    /// PUCT(s, a) = Q(s, a) + c_puct · P(s, a) · √N(s) / (1 + N(s, a))
+    /// PUCT(s, a) = −Q(s, a) + c_puct · P(s, a) · √N(s) / (1 + N(s, a))
     /// ```
     ///
-    /// where Q = mean value, P = prior, N(s) = parent visits, N(s,a) = child visits.
-    /// High `c_puct` favours exploration (prior-guided); low values favour exploitation (Q).
+    /// **Sign convention**: every node stores its accumulated value from the
+    /// perspective of the *side to move at that node*.  Backpropagation flips
+    /// sign at each level.  Therefore a child's `mean_value()` is the
+    /// *opponent's* perspective; the parent must negate it to get its own
+    /// perspective before adding the exploration bonus.
     ///
     /// Returns `None` if the parent has no children (unexpanded leaf).
     pub fn best_child(&self, parent_idx: NodeIdx, c_puct: f32) -> Option<NodeIdx> {
@@ -149,7 +152,6 @@ impl Arena {
             .max_by(|&a, &b| {
                 let sa = self.puct_score(a, sqrt_n, c_puct);
                 let sb = self.puct_score(b, sqrt_n, c_puct);
-                // unwrap_or keeps behaviour deterministic if a score is NaN
                 sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
             })
     }
@@ -157,7 +159,8 @@ impl Arena {
     #[inline]
     fn puct_score(&self, idx: NodeIdx, sqrt_parent_n: f32, c_puct: f32) -> f32 {
         let node = self.get(idx);
-        let q = node.mean_value();
+        // Negate Q: child stores value from its own (opponent's) perspective.
+        let q = -node.mean_value();
         let u = c_puct * node.prior * sqrt_parent_n / (1.0 + node.visit_count as f32);
         q + u
     }
@@ -321,28 +324,30 @@ mod tests {
 
     #[test]
     fn test_best_child_exploitation_beats_prior_at_low_c_puct() {
-        // Child A: prior=0.3, visits=10, Q=0.8  (good but low prior)
-        // Child B: prior=0.7, visits=0,  Q=0.0  (high prior, unvisited)
-        // At low c_puct the high Q of A should dominate.
+        // Child A: prior=0.3, visits=10, total_value=−8.0 → Q=−0.8 from A's
+        //   perspective = good for the parent (−Q = +0.8).
+        // Child B: prior=0.7, visits=0, Q=0.0 (high prior, unvisited).
+        // At low c_puct the exploitation term (−Q) of A should dominate.
         let (arena, root, ca, _cb) =
-            two_child_arena(0.3, 10, 8.0,  0.7, 0, 0.0,  10);
+            two_child_arena(0.3, 10, -8.0,  0.7, 0, 0.0,  10);
         assert_eq!(arena.best_child(root, 0.1), Some(ca));
     }
 
     #[test]
     fn test_best_child_exploration_beats_q_at_high_c_puct() {
-        // Same setup — at high c_puct the unvisited high-prior child B wins.
+        // Same position — at high c_puct B's larger prior wins despite A's
+        // good exploitation score.
         let (arena, root, _ca, cb) =
-            two_child_arena(0.3, 10, 8.0,  0.7, 0, 0.0,  10);
+            two_child_arena(0.3, 10, -8.0,  0.7, 0, 0.0,  10);
         assert_eq!(arena.best_child(root, 5.0), Some(cb));
     }
 
     #[test]
     fn test_puct_score_manual() {
-        // Single child: prior=0.6, visits=4, total_value=2.0 → Q=0.5
-        // Parent visits=9 → sqrt=3.0
-        // U = 1.0 * 0.6 * 3.0 / (1+4) = 0.36
-        // PUCT = 0.5 + 0.36 = 0.86
+        // Single child: prior=0.6, visits=4, total_value=2.0 → Q=0.5 from
+        //   child's perspective.
+        // Parent visits=9 → sqrt_n=3.0, c_puct=1.0.
+        // score = −Q + U = −0.5 + (1.0 * 0.6 * 3.0 / 5) = −0.5 + 0.36 = −0.14
         let mut arena = Arena::new(4);
         let root = arena.alloc(Node::new(None, 1.0, NO_PARENT));
         let child = arena.alloc(Node::new(None, 0.6, root));
@@ -352,6 +357,6 @@ mod tests {
         arena.get_mut(root).children.push(child);
 
         let score = arena.puct_score(child, 3.0, 1.0);
-        assert!((score - 0.86).abs() < 1e-5, "expected 0.86, got {score}");
+        assert!((score - (-0.14)).abs() < 1e-5, "expected -0.14, got {score}");
     }
 }

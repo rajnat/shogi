@@ -117,6 +117,37 @@ pub fn rollout<R: Rng>(board: &Board, rng: &mut R, max_depth: usize) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
+// Backpropagation
+// ---------------------------------------------------------------------------
+
+/// Walk from `leaf` up to the root, incrementing visit counts and accumulating
+/// values with alternating sign.
+///
+/// Each node stores value from the perspective of the **side to move at that
+/// node**.  Because consecutive nodes alternate sides, the value must be
+/// negated at every step going up the tree.
+///
+/// `value` should be in [−1, 1] from the perspective of the side to move at
+/// `leaf` (+1 = that side wins, −1 = that side loses).
+pub fn backprop(arena: &mut Arena, leaf: NodeIdx, value: f32) {
+    let mut node_idx = leaf;
+    let mut v = value;
+
+    loop {
+        let node = arena.get_mut(node_idx);
+        node.visit_count += 1;
+        node.total_value += v;
+
+        let parent = node.parent;
+        if parent == super::NO_PARENT {
+            break;
+        }
+        v = -v;
+        node_idx = parent;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -360,5 +391,68 @@ mod tests {
         let mut rng = seeded_rng(0);
         let v = rollout(&board, &mut rng, 0);
         assert_eq!(v, 0.0, "depth=0 should immediately return draw");
+    }
+
+    // --- Backprop tests ---
+
+    fn three_node_arena() -> (Arena, NodeIdx, NodeIdx, NodeIdx) {
+        // root (Black) → child (White) → grandchild (Black)
+        let mut arena = Arena::new(8);
+        let root  = arena.alloc(Node::new(None, 1.0, NO_PARENT));
+        let child = arena.alloc(Node::new(None, 1.0, root));
+        let gc    = arena.alloc(Node::new(None, 1.0, child));
+        arena.get_mut(root).children.push(child);
+        arena.get_mut(child).children.push(gc);
+        (arena, root, child, gc)
+    }
+
+    #[test]
+    fn test_backprop_increments_visit_counts() {
+        let (mut arena, root, child, gc) = three_node_arena();
+        backprop(&mut arena, gc, 1.0);
+        assert_eq!(arena.get(gc).visit_count,    1);
+        assert_eq!(arena.get(child).visit_count, 1);
+        assert_eq!(arena.get(root).visit_count,  1);
+    }
+
+    #[test]
+    fn test_backprop_sign_alternates() {
+        // Value at leaf is +1.0 (good for the leaf's side = Black).
+        // child (White's turn) should see −1.0.
+        // root  (Black's turn) should see +1.0 again.
+        let (mut arena, root, child, gc) = three_node_arena();
+        backprop(&mut arena, gc, 1.0);
+        assert!((arena.get(gc).total_value    -  1.0).abs() < 1e-6);
+        assert!((arena.get(child).total_value - -1.0).abs() < 1e-6);
+        assert!((arena.get(root).total_value  -  1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_backprop_from_root_only_updates_root() {
+        let (mut arena, root, child, _gc) = three_node_arena();
+        backprop(&mut arena, root, 0.5);
+        assert_eq!(arena.get(root).visit_count,  1);
+        assert_eq!(arena.get(child).visit_count, 0, "child must not be touched");
+    }
+
+    #[test]
+    fn test_backprop_accumulates_across_multiple_calls() {
+        let (mut arena, root, _child, gc) = three_node_arena();
+        backprop(&mut arena, gc,  1.0);
+        backprop(&mut arena, gc, -1.0); // draw/loss from leaf's perspective
+        assert_eq!(arena.get(gc).visit_count,   2);
+        assert_eq!(arena.get(root).visit_count, 2);
+        // net total_value at root: +1.0 + (−1.0) = 0.0
+        assert!((arena.get(root).total_value).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_backprop_mean_value_correct_after_backprop() {
+        // Two wins for the leaf side → Q at leaf = 1.0, Q at child = −1.0.
+        let (mut arena, _root, child, gc) = three_node_arena();
+        backprop(&mut arena, gc, 1.0);
+        backprop(&mut arena, gc, 1.0);
+        assert!((arena.get(gc).mean_value()    -  1.0).abs() < 1e-6);
+        assert!((arena.get(child).mean_value() - -1.0).abs() < 1e-6);
     }
 }
