@@ -1,4 +1,5 @@
 /// MCTS search phases: selection, expansion, evaluation, backpropagation.
+use std::sync::{Arc, Mutex};
 use rand::Rng;
 use rand::distributions::WeightedIndex;
 use rand::seq::SliceRandom;
@@ -56,13 +57,17 @@ pub fn select(
 /// Expand `leaf` by generating all legal moves from `board` and allocating
 /// one child node per move with uniform prior probabilities.
 ///
-/// Returns `true` if at least one child was created (non-terminal position).
-/// Returns `false` if there are no legal moves (checkmate / stalemate) —
-/// the caller should treat the leaf as a terminal and score it directly.
+/// Returns `true` if at least one child was created (non-terminal position),
+/// or if the node was already expanded by another thread.
+/// Returns `false` if there are no legal moves (checkmate / stalemate).
 ///
-/// Prior probabilities are set to `1 / N` (uniform) as a placeholder until
-/// the policy network (M5) supplies real values.
+/// The already-expanded guard prevents duplicate children when two parallel
+/// threads both select the same leaf before either has expanded it.
 pub fn expand(arena: &mut Arena, leaf: NodeIdx, board: &mut Board) -> bool {
+    if !arena.get(leaf).is_leaf() {
+        return true; // already expanded by another thread
+    }
+
     let mut moves = Vec::new();
     generate_legal_moves(board, &mut moves);
 
@@ -191,6 +196,56 @@ pub fn add_dirichlet_noise<R: Rng>(
 }
 
 // ---------------------------------------------------------------------------
+// Virtual loss
+// ---------------------------------------------------------------------------
+
+/// Magnitude of virtual loss applied per node on the selection path.
+pub const VIRTUAL_LOSS: f32 = 1.0;
+
+/// Walk from `leaf` up to the root via parent links and return the indices
+/// (leaf-to-root order).  Used to apply / remove virtual loss on the path.
+fn path_to_root(arena: &Arena, leaf: NodeIdx) -> Vec<NodeIdx> {
+    let mut path = Vec::new();
+    let mut idx = leaf;
+    loop {
+        path.push(idx);
+        let parent = arena.get(idx).parent;
+        if parent == super::NO_PARENT {
+            break;
+        }
+        idx = parent;
+    }
+    path
+}
+
+/// Mark every node on `path` as "in flight":
+///   visit_count += 1,  total_value += VIRTUAL_LOSS.
+///
+/// **Sign convention (negamax):** each node stores value from the perspective
+/// of the side to move *at that node*, and the PUCT formula at the parent
+/// negates the child's mean value: `Q = −child.mean_value()`.
+/// To make `Q` smaller (depress the path), we must make `child.mean_value()`
+/// *larger*, i.e. add to `total_value` — the opposite of what you'd do in a
+/// single-perspective tree.
+pub fn apply_virtual_loss(arena: &mut Arena, path: &[NodeIdx]) {
+    for &idx in path {
+        let n = arena.get_mut(idx);
+        n.visit_count += 1;
+        n.total_value += VIRTUAL_LOSS;
+    }
+}
+
+/// Undo the virtual loss applied by `apply_virtual_loss`.
+/// Must be called before real backpropagation to avoid double-counting.
+pub fn remove_virtual_loss(arena: &mut Arena, path: &[NodeIdx]) {
+    for &idx in path {
+        let n = arena.get_mut(idx);
+        n.visit_count = n.visit_count.saturating_sub(1);
+        n.total_value -= VIRTUAL_LOSS;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Temperature-based move selection
 // ---------------------------------------------------------------------------
 
@@ -278,26 +333,127 @@ pub fn mcts_search<R: Rng>(
         // 1. Selection
         let (leaf, undo_stack) = select(arena, root, board, config.c_puct);
 
-        // 2. Expansion
+        // 2. Virtual loss — marks path as in-flight for parallel workers.
+        let path = path_to_root(arena, leaf);
+        apply_virtual_loss(arena, &path);
+
+        // 3. Expansion
         let expanded = expand(arena, leaf, board);
 
-        // 3. Evaluation
+        // 4. Evaluation
         let value = if expanded {
             rollout(board, rng, config.rollout_depth)
         } else {
             -1.0 // terminal: side to move has no moves → they lose
         };
 
-        // 4. Backpropagation
+        // 5. Remove virtual loss, then backpropagate real result.
+        remove_virtual_loss(arena, &path);
         backprop(arena, leaf, value);
 
-        // 5. Undo moves to restore board to root position
+        // 6. Undo moves to restore board to root position.
         for (mv, undo) in undo_stack.into_iter().rev() {
             unmake_move_full(board, mv, &undo);
         }
     }
 
     select_move_by_temperature(arena, root, config.temperature, rng)
+}
+
+// ---------------------------------------------------------------------------
+// Parallel simulation loop
+// ---------------------------------------------------------------------------
+
+/// Run `num_simulations` MCTS iterations across `num_threads` rayon workers.
+///
+/// **Locking protocol** — three short critical sections per simulation; the
+/// expensive rollout runs lock-free between them:
+///
+/// 1. **Select + apply VL** (locked): descend tree, mark path in-flight.
+/// 2. **Expand** (locked): add child nodes for the leaf position.
+/// 3. **Remove VL + backprop** (locked): correct the virtual loss, record result.
+///
+/// Virtual loss between steps 1 and 3 ensures that concurrent threads see
+/// the in-flight path as unattractive and choose different branches.
+///
+/// Returns `None` only if the root has no legal moves.
+pub fn mcts_search_parallel(
+    board: &Board,
+    num_simulations: u32,
+    config: &MctsConfig,
+    num_threads: usize,
+) -> Option<Move> {
+    let arena: Arc<Mutex<Arena>> = Arc::new(Mutex::new(Arena::new(500_000)));
+    const ROOT: NodeIdx = 0;
+
+    // Single-threaded setup: root allocation, pre-expansion, optional noise.
+    {
+        let mut a = arena.lock().unwrap();
+        a.alloc(Node::new(None, 1.0, NO_PARENT));
+        if !expand(&mut a, ROOT, &mut board.clone()) {
+            return None;
+        }
+        if config.dirichlet_noise {
+            let mut rng = rand::thread_rng();
+            add_dirichlet_noise(&mut a, ROOT, config.dirichlet_alpha, config.dirichlet_epsilon, &mut rng);
+        }
+    }
+
+    let sims_per_thread = (num_simulations as usize).div_ceil(num_threads.max(1));
+
+    rayon::scope(|s| {
+        for _ in 0..num_threads {
+            let arena = Arc::clone(&arena);
+            let root_board = board.clone();
+            let config = config.clone();
+            s.spawn(move |_| {
+                let mut rng = rand::thread_rng();
+
+                for _ in 0..sims_per_thread {
+                    // --- Phase 1 (locked): select, path, apply VL ---
+                    let (leaf, move_list, vl_path) = {
+                        let mut a = arena.lock().unwrap();
+                        let mut tmp = root_board.clone();
+                        let (leaf, undo) = select(&a, ROOT, &mut tmp, config.c_puct);
+                        let path = path_to_root(&a, leaf);
+                        apply_virtual_loss(&mut a, &path);
+                        let moves: Vec<Move> = undo.into_iter().map(|(mv, _)| mv).collect();
+                        (leaf, moves, path)
+                    };
+
+                    // Replay moves onto a fresh board clone to reach the leaf
+                    // position — no lock needed, this is purely local work.
+                    let mut leaf_board = root_board.clone();
+                    for &mv in &move_list {
+                        make_move_full(&mut leaf_board, mv);
+                    }
+
+                    // --- Phase 2 (locked): expand leaf ---
+                    let expanded = {
+                        let mut a = arena.lock().unwrap();
+                        expand(&mut a, leaf, &mut leaf_board)
+                    };
+
+                    // Rollout runs completely lock-free.
+                    let value = if expanded {
+                        rollout(&leaf_board, &mut rng, config.rollout_depth)
+                    } else {
+                        -1.0
+                    };
+
+                    // --- Phase 3 (locked): remove VL, backprop ---
+                    {
+                        let mut a = arena.lock().unwrap();
+                        remove_virtual_loss(&mut a, &vl_path);
+                        backprop(&mut a, leaf, value);
+                    }
+                }
+            });
+        }
+    });
+
+    let a = arena.lock().unwrap();
+    select_move_by_temperature(&a, ROOT, config.temperature, &mut rand::thread_rng())
 }
 
 // ---------------------------------------------------------------------------
@@ -744,6 +900,130 @@ mod tests {
             let p = arena.get(child_idx).prior;
             assert!((p - expected).abs() < 1e-6, "prior should be uniform; got {p}");
         }
+    }
+
+    // --- Virtual loss tests ---
+
+    #[test]
+    fn test_apply_vl_increments_visit_and_value() {
+        // In negamax, VL adds to total_value (not subtracts) so that the
+        // parent's PUCT Q = -mean_value() goes negative, deterring selection.
+        let mut arena = Arena::new(8);
+        let root  = arena.alloc(Node::new(None, 1.0, NO_PARENT));
+        let child = arena.alloc(Node::new(None, 0.5, root));
+        arena.get_mut(root).children.push(child);
+
+        apply_virtual_loss(&mut arena, &[root, child]);
+
+        assert_eq!(arena.get(root).visit_count,  1);
+        assert_eq!(arena.get(child).visit_count, 1);
+        assert!((arena.get(root).total_value  - VIRTUAL_LOSS).abs() < 1e-6);
+        assert!((arena.get(child).total_value - VIRTUAL_LOSS).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_remove_vl_restores_zero_state() {
+        let mut arena = Arena::new(8);
+        let root = arena.alloc(Node::new(None, 1.0, NO_PARENT));
+        apply_virtual_loss(&mut arena, &[root]);
+        remove_virtual_loss(&mut arena, &[root]);
+        assert_eq!(arena.get(root).visit_count, 0);
+        assert!(arena.get(root).total_value.abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_vl_apply_remove_then_backprop_equals_plain_backprop() {
+        // apply VL → remove VL → backprop  should equal  plain backprop.
+        let mut arena1 = Arena::new(4);
+        let r1 = arena1.alloc(Node::new(None, 1.0, NO_PARENT));
+        apply_virtual_loss(&mut arena1, &[r1]);
+        remove_virtual_loss(&mut arena1, &[r1]);
+        backprop(&mut arena1, r1, 0.7);
+
+        let mut arena2 = Arena::new(4);
+        let r2 = arena2.alloc(Node::new(None, 1.0, NO_PARENT));
+        backprop(&mut arena2, r2, 0.7);
+
+        assert_eq!(arena1.get(r1).visit_count, arena2.get(r2).visit_count);
+        assert!((arena1.get(r1).total_value - arena2.get(r2).total_value).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_path_to_root_single_node() {
+        let mut arena = Arena::new(4);
+        let root = arena.alloc(Node::new(None, 1.0, NO_PARENT));
+        let path = path_to_root(&arena, root);
+        assert_eq!(path, vec![root]);
+    }
+
+    #[test]
+    fn test_path_to_root_depth_two() {
+        let mut arena = Arena::new(8);
+        let root  = arena.alloc(Node::new(None, 1.0, NO_PARENT));
+        let child = arena.alloc(Node::new(None, 0.5, root));
+        arena.get_mut(root).children.push(child);
+        let path = path_to_root(&arena, child);
+        assert_eq!(path, vec![child, root]);
+    }
+
+    #[test]
+    fn test_vl_steers_second_selection_away() {
+        // After thread A applies VL to child 0, thread B (running select on
+        // the same tree) should prefer child 1 (no VL penalty).
+        let mut board = Board::startpos();
+        let mut arena = Arena::new(256);
+        let root = arena.alloc(Node::new(None, 1.0, NO_PARENT));
+        expand(&mut arena, root, &mut board);
+        arena.get_mut(root).visit_count = 10; // non-zero so PUCT U term is live
+
+        // Apply VL to the first child simulating thread A in-flight.
+        let first_child = arena.get(root).children[0];
+        apply_virtual_loss(&mut arena, &[first_child]);
+
+        // Thread B selects: it should NOT pick first_child.
+        let mut b = board.clone();
+        let (leaf, _) = select(&arena, root, &mut b, 1.0);
+        assert_ne!(leaf, first_child, "VL should steer selection away from in-flight child");
+    }
+
+    // --- Parallel search tests ---
+
+    #[test]
+    fn test_mcts_parallel_returns_legal_move() {
+        let board = Board::startpos();
+        let mv = mcts_search_parallel(&board, 100, &MctsConfig::default(), 2);
+        assert!(mv.is_some());
+        let mut legal = Vec::new();
+        generate_legal_moves(&mut board.clone(), &mut legal);
+        assert!(legal.contains(&mv.unwrap()));
+    }
+
+    #[test]
+    fn test_mcts_parallel_board_unchanged() {
+        let board = Board::startpos();
+        let hash_before = board.hash;
+        mcts_search_parallel(&board, 100, &MctsConfig::default(), 2);
+        assert_eq!(board.hash, hash_before);
+    }
+
+    #[test]
+    fn test_mcts_parallel_single_thread_returns_legal_move() {
+        let board = Board::startpos();
+        let mv = mcts_search_parallel(&board, 50, &MctsConfig::default(), 1);
+        assert!(mv.is_some());
+        let mut legal = Vec::new();
+        generate_legal_moves(&mut board.clone(), &mut legal);
+        assert!(legal.contains(&mv.unwrap()));
+    }
+
+    #[test]
+    fn test_mcts_parallel_four_threads_returns_legal_move() {
+        let board = Board::startpos();
+        let mv = mcts_search_parallel(&board, 200, &MctsConfig::default(), 4);
+        assert!(mv.is_some());
+        let mut legal = Vec::new();
+        generate_legal_moves(&mut board.clone(), &mut legal);
+        assert!(legal.contains(&mv.unwrap()));
     }
 
     // --- Temperature selection tests ---
