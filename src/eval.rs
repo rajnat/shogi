@@ -4,6 +4,7 @@
 /// widely cited reference for computer-Shogi piece values.  All values are
 /// in centipawns (pawn = 100).
 use crate::board::Board;
+use crate::types::{rank_of, Square};
 
 // ---------------------------------------------------------------------------
 // Per-piece named constants
@@ -28,6 +29,34 @@ pub const PRO_ROOK_VALUE: i32 = 1310; // dragon king
 // ---------------------------------------------------------------------------
 // Lookup tables
 // ---------------------------------------------------------------------------
+
+/// Rank-based positional bonuses indexed by **advancement level** (0–8).
+/// ADV_IDX 0 = piece's own back rank; ADV_IDX 8 = deepest enemy territory.
+///
+/// For a Black piece at square `sq`: adv_idx = 8 − rank_of(sq)
+/// For a White piece at square `sq`: adv_idx = rank_of(sq)
+///
+/// All values are in centipawns. King is the exception — it wants adv_idx 0
+/// (own back rank) to stay safe. File-based bonuses (bishop diagonals, rook
+/// open files) are deferred to a later evaluation pass.
+pub const RANK_PST: [[i32; 9]; 14] = [
+    //   adv: [ 0,   1,   2,   3,   4,   5,   6,   7,   8]
+    //        [own            midfield            enemy]
+    [-15, -5,  0,  5, 10, 15, 20, 25, 30], // 0  Pawn
+    [ -5, -5,  0,  5, 10, 15, 20, 20,  0], // 1  Lance  (forced promote at adv=8)
+    [ -5, -5,  0,  5, 10, 15, 20, 10,  0], // 2  Knight (restricted at adv=7; forced at adv=8)
+    [ -5, -5,  0,  5,  8, 10, 12, 15, 15], // 3  Silver
+    [ -5, -5,  0,  5,  8, 10, 12, 12, 12], // 4  Gold
+    [  0,  0,  0,  5,  5,  8,  8, 10, 10], // 5  Bishop
+    [  0,  0,  0,  5,  5,  8,  8, 10, 10], // 6  Rook
+    [ 20, 15, 10,  5,  0,-10,-20,-30,-40], // 7  King   (stay home!)
+    [  0,  0,  0,  5, 10, 12, 15, 15, 15], // 8  ProPawn
+    [  0,  0,  0,  5, 10, 12, 15, 15, 15], // 9  ProLance
+    [  0,  0,  0,  5, 10, 12, 15, 15, 15], // 10 ProKnight
+    [  0,  0,  0,  5, 10, 12, 15, 15, 15], // 11 ProSilver
+    [  0,  0,  0,  5,  8, 10, 12, 15, 15], // 12 ProBishop
+    [  0,  0,  0,  5,  8, 10, 12, 15, 15], // 13 ProRook
+];
 
 /// Material value indexed by `PieceType::index()` (0 = Pawn … 13 = ProRook).
 /// King (index 7) is 0 — it is never captured and its loss means checkmate.
@@ -65,21 +94,40 @@ pub const PROMOTION_GAIN: [i32; 7] = [
 // Static evaluation
 // ---------------------------------------------------------------------------
 
-/// Static material evaluation from the perspective of `board.side_to_move`.
+/// Returns the advancement index (0 = own back rank, 8 = deepest enemy) for
+/// a piece belonging to the given side.
+#[inline]
+fn adv_idx(sq: Square, is_black: bool) -> usize {
+    let r = rank_of(sq);
+    // Black advances toward rank_idx 0; White toward rank_idx 8.
+    if is_black { (8 - r) as usize } else { r as usize }
+}
+
+/// Static evaluation from the perspective of `board.side_to_move`.
 /// Positive = good for the side to move.
 ///
-/// Sums on-board and in-hand material for both sides using `PIECE_VALUE`.
-/// Promoted pieces in hand are impossible in Shogi (they revert on capture),
-/// so the hand loop only covers indices 0–6.
+/// Combines material (on-board + in-hand) with rank-based positional bonuses
+/// from `RANK_PST`. Hand pieces have no positional component (they are off the
+/// board). Promoted pieces in hand are impossible in Shogi (they revert on
+/// capture), so the hand loop only covers indices 0–6.
 pub fn eval(board: &Board) -> i32 {
     let stm = board.side_to_move.index();
     let opp = board.side_to_move.opponent().index();
+    let stm_is_black = stm == 0; // Color::Black has index 0
     let mut score = 0i32;
 
     for pt_idx in 0..14usize {
         let val = PIECE_VALUE[pt_idx];
+        // Material
         score += board.pieces[stm][pt_idx].count() as i32 * val;
         score -= board.pieces[opp][pt_idx].count() as i32 * val;
+        // Positional (rank-based PST)
+        for sq in board.pieces[stm][pt_idx].iter_squares() {
+            score += RANK_PST[pt_idx][adv_idx(sq, stm_is_black)];
+        }
+        for sq in board.pieces[opp][pt_idx].iter_squares() {
+            score -= RANK_PST[pt_idx][adv_idx(sq, !stm_is_black)];
+        }
     }
 
     for pt_idx in 0..7usize {
@@ -176,5 +224,59 @@ mod tests {
         let score_white = eval(&board);
         assert_eq!(score_black, -score_white,
             "flipping side_to_move must negate the score");
+    }
+
+    // --- PST tests ---
+
+    #[test]
+    fn test_pst_pawn_rank_monotone() {
+        // Pawn PST should increase with advancement (adv_idx 0 → 8).
+        for i in 0..8 {
+            assert!(RANK_PST[PieceType::Pawn.index()][i + 1]
+                >= RANK_PST[PieceType::Pawn.index()][i],
+                "pawn PST must be non-decreasing: idx {} vs {}", i, i + 1);
+        }
+    }
+
+    #[test]
+    fn test_pst_king_rank_monotone_decreasing() {
+        // King PST should decrease with advancement (king wants own back rank).
+        for i in 0..8 {
+            assert!(RANK_PST[PieceType::King.index()][i + 1]
+                <= RANK_PST[PieceType::King.index()][i],
+                "king PST must be non-increasing: idx {} vs {}", i, i + 1);
+        }
+    }
+
+    #[test]
+    fn test_pst_values_in_reasonable_range() {
+        for pt in PieceType::ALL {
+            for &v in &RANK_PST[pt.index()] {
+                assert!(v >= -50 && v <= 50,
+                    "PST value {v} out of [-50, 50] for {:?}", pt);
+            }
+        }
+    }
+
+    #[test]
+    fn test_pst_adv_idx_black() {
+        use crate::types::square;
+        // Black piece at rank_idx 8 (own back rank) → adv_idx 0
+        assert_eq!(adv_idx(square(0, 8), true), 0);
+        // Black piece at rank_idx 0 (deep enemy) → adv_idx 8
+        assert_eq!(adv_idx(square(0, 0), true), 8);
+        // Black piece at rank_idx 4 (midfield) → adv_idx 4
+        assert_eq!(adv_idx(square(4, 4), true), 4);
+    }
+
+    #[test]
+    fn test_pst_adv_idx_white() {
+        use crate::types::square;
+        // White piece at rank_idx 0 (own back rank) → adv_idx 0
+        assert_eq!(adv_idx(square(0, 0), false), 0);
+        // White piece at rank_idx 8 (deep enemy) → adv_idx 8
+        assert_eq!(adv_idx(square(0, 8), false), 8);
+        // White piece at rank_idx 4 (midfield) → adv_idx 4
+        assert_eq!(adv_idx(square(4, 4), false), 4);
     }
 }
