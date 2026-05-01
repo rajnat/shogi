@@ -1,8 +1,9 @@
 /// MCTS search phases: selection, expansion, evaluation, backpropagation.
 use crate::board::Board;
+use crate::movegen::generate_legal_moves;
 use crate::moves::{make_move_full, UndoState};
 use crate::types::Move;
-use super::{Arena, NodeIdx};
+use super::{Arena, Node, NodeIdx};
 
 // ---------------------------------------------------------------------------
 // Selection
@@ -42,6 +43,37 @@ pub fn select(
     }
 
     (node_idx, undo_stack)
+}
+
+// ---------------------------------------------------------------------------
+// Expansion
+// ---------------------------------------------------------------------------
+
+/// Expand `leaf` by generating all legal moves from `board` and allocating
+/// one child node per move with uniform prior probabilities.
+///
+/// Returns `true` if at least one child was created (non-terminal position).
+/// Returns `false` if there are no legal moves (checkmate / stalemate) —
+/// the caller should treat the leaf as a terminal and score it directly.
+///
+/// Prior probabilities are set to `1 / N` (uniform) as a placeholder until
+/// the policy network (M5) supplies real values.
+pub fn expand(arena: &mut Arena, leaf: NodeIdx, board: &mut Board) -> bool {
+    let mut moves = Vec::new();
+    generate_legal_moves(board, &mut moves);
+
+    if moves.is_empty() {
+        return false;
+    }
+
+    let prior = 1.0 / moves.len() as f32;
+
+    for mv in moves {
+        let child_idx = arena.alloc(Node::new(Some(mv), prior, leaf));
+        arena.get_mut(leaf).children.push(child_idx);
+    }
+
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -163,5 +195,77 @@ mod tests {
             unmake_move_full(&mut b, mv, &undo);
         }
         assert_eq!(b.hash, board.hash);
+    }
+
+    // --- Expansion tests ---
+
+    #[test]
+    fn test_expand_startpos_creates_30_children() {
+        let mut board = Board::startpos();
+        let mut arena = Arena::new(64);
+        let root = arena.alloc(Node::new(None, 1.0, NO_PARENT));
+
+        let expanded = expand(&mut arena, root, &mut board);
+
+        assert!(expanded, "startpos is not terminal");
+        assert_eq!(arena.get(root).children.len(), 30);
+    }
+
+    #[test]
+    fn test_expand_uniform_prior() {
+        let mut board = Board::startpos();
+        let mut arena = Arena::new(64);
+        let root = arena.alloc(Node::new(None, 1.0, NO_PARENT));
+        expand(&mut arena, root, &mut board);
+
+        let expected = 1.0 / 30.0_f32;
+        for &child_idx in &arena.get(root).children.clone() {
+            let p = arena.get(child_idx).prior;
+            assert!((p - expected).abs() < 1e-6, "prior {p} != {expected}");
+        }
+    }
+
+    #[test]
+    fn test_expand_children_have_leaf_as_parent() {
+        let mut board = Board::startpos();
+        let mut arena = Arena::new(64);
+        let root = arena.alloc(Node::new(None, 1.0, NO_PARENT));
+        expand(&mut arena, root, &mut board);
+
+        for &child_idx in &arena.get(root).children.clone() {
+            assert_eq!(arena.get(child_idx).parent, root);
+        }
+    }
+
+    #[test]
+    fn test_expand_leaf_becomes_interior_node() {
+        let mut board = Board::startpos();
+        let mut arena = Arena::new(64);
+        let root = arena.alloc(Node::new(None, 1.0, NO_PARENT));
+        assert!(arena.get(root).is_leaf());
+        expand(&mut arena, root, &mut board);
+        assert!(!arena.get(root).is_leaf());
+    }
+
+    #[test]
+    fn test_expand_children_carry_moves() {
+        let mut board = Board::startpos();
+        let mut arena = Arena::new(64);
+        let root = arena.alloc(Node::new(None, 1.0, NO_PARENT));
+        expand(&mut arena, root, &mut board);
+
+        for &child_idx in &arena.get(root).children.clone() {
+            assert!(arena.get(child_idx).mv.is_some(), "every child must have a move");
+        }
+    }
+
+    #[test]
+    fn test_expand_board_unchanged_after_expand() {
+        let mut board = Board::startpos();
+        let hash_before = board.hash;
+        let mut arena = Arena::new(64);
+        let root = arena.alloc(Node::new(None, 1.0, NO_PARENT));
+        expand(&mut arena, root, &mut board);
+        assert_eq!(board.hash, hash_before, "expand must not modify the board");
     }
 }
