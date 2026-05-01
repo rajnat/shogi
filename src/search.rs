@@ -3,6 +3,7 @@ use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
 use crate::board::Board;
+use crate::eval::{eval, PIECE_VALUE};
 use crate::movegen::{generate_legal_moves, is_in_check};
 use crate::moves::{make_move_full, unmake_move_full};
 use crate::tt::{Bound, TranspositionTable};
@@ -14,29 +15,6 @@ const DELTA_MARGIN: i32 = 200;
 
 /// Default TT size used by `Searcher::new()`.
 const DEFAULT_TT_MB: usize = 64;
-
-// ---------------------------------------------------------------------------
-// Piece values (centipawns, roughly calibrated to standard Shogi tables)
-// ---------------------------------------------------------------------------
-
-/// Material value for each PieceType, indexed by PieceType::index().
-/// Order matches the PieceType enum: Pawn=0 … ProRook=13.
-pub const PIECE_VALUE: [i32; 14] = [
-    100,  // Pawn
-    430,  // Lance
-    450,  // Knight
-    640,  // Silver
-    690,  // Gold
-    890,  // Bishop
-    1040, // Rook
-    0,    // King (not counted — its "value" is mate)
-    530,  // ProPawn   (tokin)
-    530,  // ProLance
-    540,  // ProKnight
-    640,  // ProSilver
-    1120, // ProBishop (dragon horse)
-    1310, // ProRook   (dragon king)
-];
 
 /// Score used to signal checkmate at the root.  Large enough to dominate any
 /// material swing, small enough not to overflow when negated.
@@ -102,36 +80,6 @@ pub fn score_move(mv: Move, board: &Board) -> i32 {
 /// Sort `moves` in-place, highest score first.
 pub fn order_moves(moves: &mut [Move], board: &Board) {
     moves.sort_unstable_by(|&a, &b| score_move(b, board).cmp(&score_move(a, board)));
-}
-
-// ---------------------------------------------------------------------------
-// Evaluation
-// ---------------------------------------------------------------------------
-
-/// Static evaluation of `board` from the perspective of `side_to_move`.
-/// Positive = good for the side to move, negative = bad.
-///
-/// Currently material only; later steps will add piece-square tables and
-/// king safety.
-pub fn eval(board: &Board) -> i32 {
-    let stm = board.side_to_move.index();
-    let opp = board.side_to_move.opponent().index();
-    let mut score = 0i32;
-
-    for pt_idx in 0..14 {
-        let val = PIECE_VALUE[pt_idx];
-        score += board.pieces[stm][pt_idx].count() as i32 * val;
-        score -= board.pieces[opp][pt_idx].count() as i32 * val;
-    }
-
-    // Hand pieces (indices 0–6 only; king and promoted pieces cannot be in hand)
-    for pt_idx in 0..7 {
-        let val = PIECE_VALUE[pt_idx];
-        score += board.hand[stm][pt_idx] as i32 * val;
-        score -= board.hand[opp][pt_idx] as i32 * val;
-    }
-
-    score
 }
 
 // ---------------------------------------------------------------------------
@@ -538,24 +486,8 @@ impl Searcher {
 mod tests {
     use super::*;
     use crate::board::Board;
+    use crate::eval::eval;
     use crate::types::PieceType;
-
-    #[test]
-    fn test_eval_startpos_is_zero() {
-        // Material is symmetric at the starting position so the eval must be 0
-        // regardless of which side is to move.
-        let board = Board::startpos();
-        assert_eq!(eval(&board), 0);
-    }
-
-    #[test]
-    fn test_eval_sign_convention() {
-        // Give Black an extra pawn in hand; eval should be positive for Black
-        // (Black to move) and negative if we flip side_to_move artificially.
-        let mut board = Board::startpos();
-        board.hand[0][PieceType::Pawn.index()] += 1; // Black gains a pawn
-        assert!(eval(&board) > 0, "Extra pawn should be positive for side to move");
-    }
 
     #[test]
     fn test_minimax_depth0_returns_move() {
@@ -614,18 +546,7 @@ mod tests {
         assert!(minimax(&mut board, 1).is_some());
     }
 
-    #[test]
-    fn test_piece_values_sanity() {
-        // Promoted pieces should be worth more than their base counterparts.
-        assert!(PIECE_VALUE[PieceType::ProPawn.index()] > PIECE_VALUE[PieceType::Pawn.index()]);
-        assert!(PIECE_VALUE[PieceType::ProBishop.index()] > PIECE_VALUE[PieceType::Bishop.index()]);
-        assert!(PIECE_VALUE[PieceType::ProRook.index()] > PIECE_VALUE[PieceType::Rook.index()]);
-        // Rook > Bishop > Gold > Silver > Knight ≈ Lance > Pawn
-        assert!(PIECE_VALUE[PieceType::Rook.index()] > PIECE_VALUE[PieceType::Bishop.index()]);
-        assert!(PIECE_VALUE[PieceType::Bishop.index()] > PIECE_VALUE[PieceType::Gold.index()]);
-        assert!(PIECE_VALUE[PieceType::Gold.index()] > PIECE_VALUE[PieceType::Silver.index()]);
-        assert!(PIECE_VALUE[PieceType::Silver.index()] > PIECE_VALUE[PieceType::Pawn.index()]);
-    }
+    // Piece-value ordering sanity is tested in eval::tests.
 
     // -----------------------------------------------------------------------
     // alpha-beta correctness and node-count improvement
