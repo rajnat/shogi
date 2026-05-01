@@ -5,6 +5,9 @@
 /// contiguous.  All values are in [−1, 1]: +1 = win for the side that just
 /// moved into this node, −1 = loss.
 pub mod search;
+pub mod params;
+
+pub use params::MctsConfig;
 
 use crate::types::Move;
 
