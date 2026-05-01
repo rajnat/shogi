@@ -3,9 +3,9 @@ use rand::Rng;
 use rand::seq::SliceRandom;
 use crate::board::Board;
 use crate::movegen::generate_legal_moves;
-use crate::moves::{make_move_full, UndoState};
+use crate::moves::{make_move_full, unmake_move_full, UndoState};
 use crate::types::{Color, Move};
-use super::{Arena, Node, NodeIdx};
+use super::{Arena, Node, NodeIdx, NO_PARENT};
 
 // ---------------------------------------------------------------------------
 // Selection
@@ -145,6 +145,70 @@ pub fn backprop(arena: &mut Arena, leaf: NodeIdx, value: f32) {
         v = -v;
         node_idx = parent;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Simulation loop
+// ---------------------------------------------------------------------------
+
+/// Run `num_simulations` MCTS iterations from `board` and return the best move.
+///
+/// Each iteration:
+///   1. **Select** — descend via PUCT to a leaf, applying moves to `board`.
+///   2. **Expand** — add children for all legal moves (skipped if terminal).
+///   3. **Evaluate** — random rollout to terminal.
+///   4. **Backprop** — propagate the result up to the root, flipping sign.
+///   5. **Undo** — restore `board` to the root position.
+///
+/// Returns the child of the root with the highest visit count, which is the
+/// move recommended by the search.  Returns `None` only if the root has no
+/// legal moves (checkmate at the root).
+///
+/// `c_puct` controls exploration; `rollout_depth` caps single-game rollouts.
+pub fn mcts_search<R: Rng>(
+    arena: &mut Arena,
+    board: &mut Board,
+    num_simulations: u32,
+    c_puct: f32,
+    rollout_depth: usize,
+    rng: &mut R,
+) -> Option<Move> {
+    // Initialise the arena with a fresh root for this search.
+    arena.clear();
+    let root = arena.alloc(Node::new(None, 1.0, NO_PARENT));
+
+    for _ in 0..num_simulations {
+        // --- 1. Selection ---
+        let (leaf, undo_stack) = select(arena, root, board, c_puct);
+
+        // --- 2. Expansion ---
+        let expanded = expand(arena, leaf, board);
+
+        // --- 3. Evaluation ---
+        let value = if expanded {
+            rollout(board, rng, rollout_depth)
+        } else {
+            // Terminal node: the side to move at `leaf` has no moves → they lose.
+            -1.0
+        };
+
+        // --- 4. Backpropagation ---
+        backprop(arena, leaf, value);
+
+        // --- 5. Undo moves to restore board to root position ---
+        for (mv, undo) in undo_stack.into_iter().rev() {
+            unmake_move_full(board, mv, &undo);
+        }
+    }
+
+    // Return the root child with the highest visit count.
+    arena
+        .get(root)
+        .children
+        .iter()
+        .copied()
+        .max_by_key(|&idx| arena.get(idx).visit_count)
+        .and_then(|idx| arena.get(idx).mv)
 }
 
 // ---------------------------------------------------------------------------
@@ -454,5 +518,59 @@ mod tests {
         backprop(&mut arena, gc, 1.0);
         assert!((arena.get(gc).mean_value()    -  1.0).abs() < 1e-6);
         assert!((arena.get(child).mean_value() - -1.0).abs() < 1e-6);
+    }
+
+    // --- Simulation loop tests ---
+
+    #[test]
+    fn test_mcts_returns_legal_move() {
+        let mut board = Board::startpos();
+        let mut arena = Arena::new(4096);
+        let mut rng = seeded_rng(0);
+
+        let mv = mcts_search(&mut arena, &mut board, 50, 1.0, DEFAULT_ROLLOUT_DEPTH, &mut rng);
+        assert!(mv.is_some(), "must return a move from startpos");
+
+        // Verify the move is actually legal.
+        let mut legal = Vec::new();
+        generate_legal_moves(&mut board.clone(), &mut legal);
+        assert!(legal.contains(&mv.unwrap()), "returned move must be legal");
+    }
+
+    #[test]
+    fn test_mcts_board_unchanged_after_search() {
+        let mut board = Board::startpos();
+        let hash_before = board.hash;
+        let mut arena = Arena::new(4096);
+        let mut rng = seeded_rng(1);
+
+        mcts_search(&mut arena, &mut board, 50, 1.0, DEFAULT_ROLLOUT_DEPTH, &mut rng);
+        assert_eq!(board.hash, hash_before, "board must be restored after search");
+    }
+
+    #[test]
+    fn test_mcts_root_visit_count_equals_simulations() {
+        let mut board = Board::startpos();
+        let mut arena = Arena::new(4096);
+        let mut rng = seeded_rng(2);
+
+        mcts_search(&mut arena, &mut board, 100, 1.0, DEFAULT_ROLLOUT_DEPTH, &mut rng);
+        assert_eq!(arena.get(arena.root()).visit_count, 100);
+    }
+
+    #[test]
+    fn test_mcts_more_simulations_visits_more_nodes() {
+        let mut board = Board::startpos();
+        let mut rng1 = seeded_rng(3);
+        let mut rng2 = seeded_rng(3);
+
+        let mut arena1 = Arena::new(4096);
+        mcts_search(&mut arena1, &mut board, 20, 1.0, DEFAULT_ROLLOUT_DEPTH, &mut rng1);
+
+        let mut arena2 = Arena::new(4096);
+        mcts_search(&mut arena2, &mut board, 200, 1.0, DEFAULT_ROLLOUT_DEPTH, &mut rng2);
+
+        assert!(arena2.len() > arena1.len(),
+            "more simulations should produce a larger tree");
     }
 }
