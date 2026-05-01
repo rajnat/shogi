@@ -4,6 +4,8 @@
 /// children by index, avoiding pointer indirection and keeping allocations
 /// contiguous.  All values are in [−1, 1]: +1 = win for the side that just
 /// moved into this node, −1 = loss.
+pub mod search;
+
 use crate::types::Move;
 
 /// Index into the MCTS arena.
