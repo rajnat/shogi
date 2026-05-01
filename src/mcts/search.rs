@@ -1,8 +1,10 @@
 /// MCTS search phases: selection, expansion, evaluation, backpropagation.
+use rand::Rng;
+use rand::seq::SliceRandom;
 use crate::board::Board;
 use crate::movegen::generate_legal_moves;
 use crate::moves::{make_move_full, UndoState};
-use crate::types::Move;
+use crate::types::{Color, Move};
 use super::{Arena, Node, NodeIdx};
 
 // ---------------------------------------------------------------------------
@@ -74,6 +76,44 @@ pub fn expand(arena: &mut Arena, leaf: NodeIdx, board: &mut Board) -> bool {
     }
 
     true
+}
+
+// ---------------------------------------------------------------------------
+// Evaluation — random rollout (uniform policy placeholder)
+// ---------------------------------------------------------------------------
+
+/// Default cap on rollout depth. Shogi games rarely exceed 300 moves;
+/// 200 is enough to reach a terminal in the vast majority of rollouts.
+pub const DEFAULT_ROLLOUT_DEPTH: usize = 200;
+
+/// Play random moves from `board` until checkmate or `max_depth` is reached.
+///
+/// Returns the outcome **from the perspective of the side to move at the time
+/// of the call**:
+///   +1.0  — that side wins
+///   −1.0  — that side loses
+///    0.0  — draw (max depth reached without a terminal)
+///
+/// The board passed in is never modified; rollout works on an internal clone.
+/// This function is the placeholder until the neural network (M5) takes over.
+pub fn rollout<R: Rng>(board: &Board, rng: &mut R, max_depth: usize) -> f32 {
+    let mut b = board.clone();
+    let initial_side: Color = b.side_to_move;
+
+    for _ in 0..max_depth {
+        let mut moves = Vec::new();
+        generate_legal_moves(&mut b, &mut moves);
+
+        if moves.is_empty() {
+            // The side currently to move has no legal moves — they lose.
+            return if b.side_to_move == initial_side { -1.0 } else { 1.0 };
+        }
+
+        let &mv = moves.choose(rng).expect("moves is non-empty");
+        let _ = make_move_full(&mut b, mv);
+    }
+
+    0.0 // max depth reached — treat as draw
 }
 
 // ---------------------------------------------------------------------------
@@ -267,5 +307,58 @@ mod tests {
         let root = arena.alloc(Node::new(None, 1.0, NO_PARENT));
         expand(&mut arena, root, &mut board);
         assert_eq!(board.hash, hash_before, "expand must not modify the board");
+    }
+
+    // --- Rollout tests ---
+
+    fn seeded_rng(seed: u64) -> rand::rngs::StdRng {
+        use rand::SeedableRng;
+        rand::rngs::StdRng::seed_from_u64(seed)
+    }
+
+    #[test]
+    fn test_rollout_does_not_modify_board() {
+        let board = Board::startpos();
+        let hash_before = board.hash;
+        let mut rng = seeded_rng(0);
+        rollout(&board, &mut rng, DEFAULT_ROLLOUT_DEPTH);
+        assert_eq!(board.hash, hash_before);
+    }
+
+    #[test]
+    fn test_rollout_value_in_valid_range() {
+        let board = Board::startpos();
+        let mut rng = seeded_rng(1);
+        let v = rollout(&board, &mut rng, DEFAULT_ROLLOUT_DEPTH);
+        assert!(v == -1.0 || v == 0.0 || v == 1.0,
+            "rollout value must be -1, 0, or 1; got {v}");
+    }
+
+    #[test]
+    fn test_rollout_deterministic_with_same_seed() {
+        let board = Board::startpos();
+        let v1 = rollout(&board, &mut seeded_rng(99), DEFAULT_ROLLOUT_DEPTH);
+        let v2 = rollout(&board, &mut seeded_rng(99), DEFAULT_ROLLOUT_DEPTH);
+        assert_eq!(v1, v2, "same seed must produce the same outcome");
+    }
+
+    #[test]
+    fn test_rollout_different_seeds_may_differ() {
+        // With 30 possible first moves and deep random play, two different seeds
+        // will almost certainly produce different results over many samples.
+        let board = Board::startpos();
+        let outcomes: Vec<f32> = (0..20)
+            .map(|s| rollout(&board, &mut seeded_rng(s), DEFAULT_ROLLOUT_DEPTH))
+            .collect();
+        let all_same = outcomes.windows(2).all(|w| w[0] == w[1]);
+        assert!(!all_same, "different seeds should not all produce identical outcomes");
+    }
+
+    #[test]
+    fn test_rollout_max_depth_zero_returns_draw() {
+        let board = Board::startpos();
+        let mut rng = seeded_rng(0);
+        let v = rollout(&board, &mut rng, 0);
+        assert_eq!(v, 0.0, "depth=0 should immediately return draw");
     }
 }
