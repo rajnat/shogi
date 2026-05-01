@@ -104,6 +104,11 @@ const SHIELD_GOLD: i32 = 8;   // extra for gold / gold-equivalent defenders
 const SHIELD_SILVER: i32 = 4; // extra for silver
 const EXPOSED_SQ: i32 = -12;  // penalty for each empty neighbour square
 
+/// Small bonus for the side that has the move.
+/// Corrects for the static eval's blindness to "this side acts next."
+/// Kept small because quiescence search already absorbs most of the effect.
+pub const TEMPO: i32 = 15;
+
 /// Bitboard of gold-equivalent pieces (Gold + all four promoted minors, which
 /// move like Gold) for `color_idx`.
 #[inline]
@@ -203,6 +208,9 @@ pub fn eval(board: &Board) -> i32 {
     score += king_safety(board, stm);
     score -= king_safety(board, opp);
 
+    // Tempo: the side to move gets to act next
+    score += TEMPO;
+
     score
 }
 
@@ -269,9 +277,11 @@ mod tests {
     }
 
     #[test]
-    fn test_eval_startpos_is_zero() {
+    fn test_eval_startpos_is_tempo() {
+        // Startpos is materially and positionally symmetric, so eval == TEMPO
+        // (the only asymmetry is that Black is about to move).
         let board = Board::startpos();
-        assert_eq!(eval(&board), 0, "startpos is perfectly symmetric");
+        assert_eq!(eval(&board), TEMPO, "startpos eval must equal the tempo bonus");
     }
 
     #[test]
@@ -283,14 +293,16 @@ mod tests {
 
     #[test]
     fn test_eval_symmetric_flip() {
-        // Swapping side_to_move negates the score.
+        // With tempo, eval(pos, stm=A) + eval(pos, stm=B) == 2 * TEMPO.
+        // The non-tempo component still negates; tempo always adds the same
+        // constant for whoever is to move.
         let mut board = Board::startpos();
         board.hand[0][PieceType::Rook.index()] += 1; // Black holds a rook
         let score_black = eval(&board);
         board.side_to_move = board.side_to_move.opponent();
         let score_white = eval(&board);
-        assert_eq!(score_black, -score_white,
-            "flipping side_to_move must negate the score");
+        assert_eq!(score_black + score_white, 2 * TEMPO,
+            "non-tempo component must negate: black={score_black} white={score_white}");
     }
 
     // --- PST tests ---
@@ -386,21 +398,21 @@ mod tests {
     }
 
     #[test]
-    fn test_eval_startpos_still_zero_with_king_safety() {
-        // Full eval (material + PST + king safety) on startpos must be zero.
+    fn test_eval_startpos_with_king_safety_and_tempo() {
+        // Full eval on startpos: all symmetric terms cancel, only tempo remains.
         let board = Board::startpos();
-        assert_eq!(eval(&board), 0, "startpos eval must remain zero");
+        assert_eq!(eval(&board), TEMPO);
     }
 
     #[test]
     fn test_eval_symmetric_flip_with_king_safety() {
-        // eval(pos, stm=A) == -eval(pos, stm=B) must hold with king safety.
+        // Same invariant as above, now verifying king safety doesn't break it.
         let mut board = Board::startpos();
         board.hand[0][PieceType::Rook.index()] += 1;
         let score_black = eval(&board);
         board.side_to_move = board.side_to_move.opponent();
         let score_white = eval(&board);
-        assert_eq!(score_black, -score_white,
-            "flipping side_to_move must negate the score");
+        assert_eq!(score_black + score_white, 2 * TEMPO,
+            "non-tempo component must negate: black={score_black} white={score_white}");
     }
 }
