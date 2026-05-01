@@ -26,6 +26,17 @@ pub struct MctsConfig {
     /// Should be `true` during self-play, `false` for analysis/search.
     /// Default: false.
     pub dirichlet_noise: bool,
+
+    /// Move-selection temperature τ applied to root visit counts.
+    ///
+    /// Move a is chosen with probability proportional to N(a)^(1/τ):
+    ///   τ = 0  — greedy argmax (deterministic, best for analysis)
+    ///   τ = 1  — sample proportional to visit count (AlphaZero early-game)
+    ///   τ > 1  — flatter distribution, more exploratory
+    ///
+    /// AlphaZero uses τ=1 for the first ~30 moves of each self-play game,
+    /// then drops to τ→0. Default: 0.0 (greedy).
+    pub temperature: f32,
 }
 
 impl Default for MctsConfig {
@@ -36,6 +47,7 @@ impl Default for MctsConfig {
             dirichlet_alpha: 0.15,
             dirichlet_epsilon: 0.25,
             dirichlet_noise: false,
+            temperature: 0.0,
         }
     }
 }

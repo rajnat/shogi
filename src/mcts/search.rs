@@ -1,5 +1,6 @@
 /// MCTS search phases: selection, expansion, evaluation, backpropagation.
 use rand::Rng;
+use rand::distributions::WeightedIndex;
 use rand::seq::SliceRandom;
 use rand_distr::{Distribution, Gamma};
 use crate::board::Board;
@@ -190,6 +191,52 @@ pub fn add_dirichlet_noise<R: Rng>(
 }
 
 // ---------------------------------------------------------------------------
+// Temperature-based move selection
+// ---------------------------------------------------------------------------
+
+/// Choose a move from `root`'s children using the visit-count distribution
+/// raised to the power `1/τ`.
+///
+/// τ = 0  → greedy: always pick the child with the highest visit count.
+/// τ > 0  → sample: move `a` is chosen with probability ∝ N(a)^(1/τ).
+///
+/// Returns `None` if the root has no children.
+pub fn select_move_by_temperature<R: Rng>(
+    arena: &Arena,
+    root: NodeIdx,
+    temperature: f32,
+    rng: &mut R,
+) -> Option<Move> {
+    let children = &arena.get(root).children;
+    if children.is_empty() {
+        return None;
+    }
+
+    if temperature < 1e-6 {
+        // Greedy: argmax visit count.
+        return children
+            .iter()
+            .copied()
+            .max_by_key(|&idx| arena.get(idx).visit_count)
+            .and_then(|idx| arena.get(idx).mv);
+    }
+
+    let inv_temp = 1.0 / temperature;
+    let weights: Vec<f32> = children
+        .iter()
+        .map(|&idx| (arena.get(idx).visit_count as f32).powf(inv_temp))
+        .collect();
+
+    // WeightedIndex::new returns Err if all weights are zero (no visits yet).
+    // Fall back to uniform in that case.
+    let chosen = match WeightedIndex::new(&weights) {
+        Ok(dist) => children[dist.sample(rng)],
+        Err(_) => children[rng.gen_range(0..children.len())],
+    };
+    arena.get(chosen).mv
+}
+
+// ---------------------------------------------------------------------------
 // Simulation loop
 // ---------------------------------------------------------------------------
 
@@ -250,14 +297,7 @@ pub fn mcts_search<R: Rng>(
         }
     }
 
-    // Best move = root child with highest visit count.
-    arena
-        .get(root)
-        .children
-        .iter()
-        .copied()
-        .max_by_key(|&idx| arena.get(idx).visit_count)
-        .and_then(|idx| arena.get(idx).mv)
+    select_move_by_temperature(arena, root, config.temperature, rng)
 }
 
 // ---------------------------------------------------------------------------
@@ -704,6 +744,126 @@ mod tests {
             let p = arena.get(child_idx).prior;
             assert!((p - expected).abs() < 1e-6, "prior should be uniform; got {p}");
         }
+    }
+
+    // --- Temperature selection tests ---
+
+    /// Build a root with children whose visit counts are set manually.
+    fn arena_with_visit_counts(counts: &[u32]) -> (Arena, NodeIdx) {
+        let mut arena = Arena::new(64);
+        let root = arena.alloc(Node::new(None, 1.0, NO_PARENT));
+        for (i, &n) in counts.iter().enumerate() {
+            let child = arena.alloc(Node::new(
+                // Use a dummy move value — only identity matters for these tests.
+                Some(crate::types::Move(i as u32 + 1)),
+                1.0 / counts.len() as f32,
+                root,
+            ));
+            arena.get_mut(child).visit_count = n;
+            arena.get_mut(root).children.push(child);
+        }
+        (arena, root)
+    }
+
+    #[test]
+    fn test_temperature_zero_picks_most_visited() {
+        // counts: child 0 = 5, child 1 = 20, child 2 = 1.  Child 1 must win.
+        let (arena, root) = arena_with_visit_counts(&[5, 20, 1]);
+        let mut rng = seeded_rng(20);
+        let mv = select_move_by_temperature(&arena, root, 0.0, &mut rng);
+        // child 1 is arena index 2 (root=0, child0=1, child1=2).
+        assert_eq!(mv, arena.get(2).mv, "greedy must pick child with visit_count=20");
+    }
+
+    #[test]
+    fn test_temperature_zero_deterministic() {
+        let (arena, root) = arena_with_visit_counts(&[3, 10, 1]);
+        let mv1 = select_move_by_temperature(&arena, root, 0.0, &mut seeded_rng(0));
+        let mv2 = select_move_by_temperature(&arena, root, 0.0, &mut seeded_rng(99));
+        assert_eq!(mv1, mv2, "greedy must be deterministic regardless of seed");
+    }
+
+    #[test]
+    fn test_temperature_one_samples_proportionally() {
+        // Counts heavily skewed: child 0 = 1, child 1 = 999.
+        // With τ=1 and many samples, child 1 should be picked ~99.9% of the time.
+        let (arena, root) = arena_with_visit_counts(&[1, 999]);
+        let mut rng = seeded_rng(42);
+        let child_1_mv = arena.get(2).mv; // root=0, child0=1, child1=2
+
+        let n = 200u32;
+        let child_1_count = (0..n)
+            .filter(|_| select_move_by_temperature(&arena, root, 1.0, &mut rng) == child_1_mv)
+            .count();
+
+        assert!(
+            child_1_count > 180,
+            "child with 999 visits should be chosen >90% of the time; got {child_1_count}/{n}"
+        );
+    }
+
+    #[test]
+    fn test_temperature_high_flattens_distribution() {
+        // Counts: child 0 = 1, child 1 = 1000.
+        // At τ=10 the distribution should be much flatter than τ=1.
+        let (arena, root) = arena_with_visit_counts(&[1, 1000]);
+        let mut rng = seeded_rng(55);
+        let child_1_mv = arena.get(2).mv;
+
+        let n = 200u32;
+        let count_high_t = (0..n)
+            .filter(|_| select_move_by_temperature(&arena, root, 10.0, &mut rng) == child_1_mv)
+            .count();
+
+        // With τ=1 we'd expect ~99.9% child 1; with τ=10 it should be noticeably less.
+        assert!(
+            count_high_t < 200,
+            "high temperature should occasionally pick the less-visited child"
+        );
+    }
+
+    #[test]
+    fn test_temperature_none_for_empty_root() {
+        let mut arena = Arena::new(8);
+        let root = arena.alloc(Node::new(None, 1.0, NO_PARENT));
+        let mut rng = seeded_rng(0);
+        let mv = select_move_by_temperature(&arena, root, 1.0, &mut rng);
+        assert!(mv.is_none());
+    }
+
+    #[test]
+    fn test_mcts_default_temperature_zero_returns_best() {
+        // With τ=0 the returned move must be the most-visited root child.
+        let mut board = Board::startpos();
+        let mut arena = Arena::new(4096);
+        let mut rng = seeded_rng(30);
+
+        let mv = mcts_search(&mut arena, &mut board, 100, &MctsConfig::default(), &mut rng);
+
+        let expected = arena
+            .get(arena.root())
+            .children
+            .iter()
+            .copied()
+            .max_by_key(|&i| arena.get(i).visit_count)
+            .and_then(|i| arena.get(i).mv);
+
+        assert_eq!(mv, expected, "τ=0 must return the most-visited move");
+    }
+
+    #[test]
+    fn test_mcts_temperature_one_still_legal() {
+        let mut board = Board::startpos();
+        let mut arena = Arena::new(4096);
+        let mut rng = seeded_rng(31);
+        let config = MctsConfig { temperature: 1.0, ..MctsConfig::default() };
+
+        let mv = mcts_search(&mut arena, &mut board, 100, &config, &mut rng);
+        assert!(mv.is_some());
+
+        let mut legal = Vec::new();
+        generate_legal_moves(&mut board.clone(), &mut legal);
+        assert!(legal.contains(&mv.unwrap()), "temperature=1 must still return a legal move");
     }
 
     #[test]
