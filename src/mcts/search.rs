@@ -558,6 +558,57 @@ mod tests {
         assert_eq!(arena.get(arena.root()).visit_count, 100);
     }
 
+    /// Quick sanity check — not part of CI.
+    /// Run with: cargo test mcts_sanity -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn mcts_sanity_startpos() {
+        use std::time::Instant;
+
+        let num_sims = 500u32;
+        let mut board  = Board::startpos();
+        let mut arena  = Arena::new(200_000);
+        let mut rng    = seeded_rng(42);
+
+        let t0   = Instant::now();
+        let best = mcts_search(
+            &mut arena, &mut board,
+            num_sims, 1.0, DEFAULT_ROLLOUT_DEPTH, &mut rng,
+        );
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let sims_per_s = num_sims as f64 / (elapsed_ms / 1000.0);
+
+        println!("\n--- MCTS startpos ({num_sims} sims) ---");
+        println!("time     : {elapsed_ms:.1} ms");
+        println!("sims/sec : {sims_per_s:.0}");
+        println!("nodes    : {}", arena.len());
+        println!("best move: {}", best.map(|m| m.to_usi_string()).unwrap_or("none".into()));
+        println!();
+
+        // Sort root children by visit count descending.
+        let mut children: Vec<NodeIdx> = arena.get(arena.root()).children.clone();
+        children.sort_by(|&a, &b| {
+            arena.get(b).visit_count.cmp(&arena.get(a).visit_count)
+        });
+
+        println!("{:<10}  {:>6}  {:>7}", "move", "visits", "Q(stm)");
+        println!("{}", "-".repeat(28));
+        for &idx in children.iter().take(10) {
+            let node = arena.get(idx);
+            // Negate: child stores value from its own (opponent's) perspective.
+            let q_for_stm = -node.mean_value();
+            println!(
+                "{:<10}  {:>6}  {:>+7.3}",
+                node.mv.unwrap().to_usi_string(),
+                node.visit_count,
+                q_for_stm,
+            );
+        }
+        if children.len() > 10 {
+            println!("... ({} total children)", children.len());
+        }
+    }
+
     #[test]
     fn test_mcts_more_simulations_visits_more_nodes() {
         let mut board = Board::startpos();
