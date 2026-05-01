@@ -61,6 +61,69 @@ impl Node {
 }
 
 // ---------------------------------------------------------------------------
+// Arena allocator
+// ---------------------------------------------------------------------------
+
+/// Flat pool of MCTS nodes referenced by `NodeIdx`.
+///
+/// All nodes for a single search live in one contiguous allocation.  Calling
+/// `clear()` between searches resets the node count to zero but keeps the
+/// backing memory, so repeated searches avoid repeated heap allocations.
+pub struct Arena {
+    nodes: Vec<Node>,
+}
+
+impl Arena {
+    /// Create an arena pre-allocated for `capacity` nodes.
+    pub fn new(capacity: usize) -> Self {
+        Arena {
+            nodes: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Allocate `node` in the arena and return its index.
+    /// Panics if the index would overflow `NodeIdx` (u32::MAX nodes).
+    pub fn alloc(&mut self, node: Node) -> NodeIdx {
+        let idx = self.nodes.len() as NodeIdx;
+        self.nodes.push(node);
+        idx
+    }
+
+    /// Immutable access to a node by index.
+    #[inline]
+    pub fn get(&self, idx: NodeIdx) -> &Node {
+        &self.nodes[idx as usize]
+    }
+
+    /// Mutable access to a node by index.
+    #[inline]
+    pub fn get_mut(&mut self, idx: NodeIdx) -> &mut Node {
+        &mut self.nodes[idx as usize]
+    }
+
+    /// The root node is always allocated first and lives at index 0.
+    #[inline]
+    pub fn root(&self) -> NodeIdx {
+        0
+    }
+
+    /// Reset the arena for a new search.
+    /// Drops all nodes but retains the backing allocation.
+    pub fn clear(&mut self) {
+        self.nodes.clear();
+    }
+
+    /// Number of nodes currently in the arena.
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -109,5 +172,73 @@ mod tests {
         let mut node = Node::new(None, 1.0, NO_PARENT);
         node.children.push(1);
         assert!(!node.is_leaf());
+    }
+
+    // --- Arena tests ---
+
+    #[test]
+    fn test_arena_alloc_sequential_indices() {
+        let mut arena = Arena::new(8);
+        let i0 = arena.alloc(Node::new(None, 1.0, NO_PARENT));
+        let i1 = arena.alloc(Node::new(None, 0.5, i0));
+        let i2 = arena.alloc(Node::new(None, 0.5, i0));
+        assert_eq!(i0, 0);
+        assert_eq!(i1, 1);
+        assert_eq!(i2, 2);
+    }
+
+    #[test]
+    fn test_arena_get_returns_correct_node() {
+        let mut arena = Arena::new(4);
+        arena.alloc(Node::new(None, 1.0, NO_PARENT));
+        arena.alloc(Node::new(None, 0.25, 0));
+        assert!((arena.get(1).prior - 0.25).abs() < 1e-6);
+        assert_eq!(arena.get(1).parent, 0);
+    }
+
+    #[test]
+    fn test_arena_get_mut_modifies_node() {
+        let mut arena = Arena::new(4);
+        arena.alloc(Node::new(None, 1.0, NO_PARENT));
+        arena.get_mut(0).visit_count = 7;
+        assert_eq!(arena.get(0).visit_count, 7);
+    }
+
+    #[test]
+    fn test_arena_root_is_zero() {
+        let arena = Arena::new(4);
+        assert_eq!(arena.root(), 0);
+    }
+
+    #[test]
+    fn test_arena_clear_resets_len() {
+        let mut arena = Arena::new(8);
+        arena.alloc(Node::new(None, 1.0, NO_PARENT));
+        arena.alloc(Node::new(None, 0.5, 0));
+        assert_eq!(arena.len(), 2);
+        arena.clear();
+        assert_eq!(arena.len(), 0);
+        assert!(arena.is_empty());
+    }
+
+    #[test]
+    fn test_arena_clear_keeps_capacity() {
+        let mut arena = Arena::new(64);
+        for _ in 0..10 {
+            arena.alloc(Node::new(None, 1.0, NO_PARENT));
+        }
+        let cap_before = arena.nodes.capacity();
+        arena.clear();
+        assert_eq!(arena.nodes.capacity(), cap_before);
+    }
+
+    #[test]
+    fn test_arena_reuse_after_clear() {
+        let mut arena = Arena::new(8);
+        arena.alloc(Node::new(None, 1.0, NO_PARENT));
+        arena.clear();
+        let idx = arena.alloc(Node::new(None, 0.9, NO_PARENT));
+        assert_eq!(idx, 0); // index resets to 0 after clear
+        assert!((arena.get(0).prior - 0.9).abs() < 1e-6);
     }
 }
