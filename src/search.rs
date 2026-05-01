@@ -5,7 +5,11 @@ use std::time::{Duration, Instant};
 use crate::board::Board;
 use crate::movegen::generate_legal_moves;
 use crate::moves::{make_move_full, unmake_move_full};
+use crate::tt::{Bound, TranspositionTable};
 use crate::types::Move;
+
+/// Default TT size used by `Searcher::new()`.
+const DEFAULT_TT_MB: usize = 64;
 
 // ---------------------------------------------------------------------------
 // Piece values (centipawns, roughly calibrated to standard Shogi tables)
@@ -199,6 +203,7 @@ pub fn minimax(board: &mut Board, depth: u32) -> Option<(Move, i32)> {
 #[derive(Debug, Default, Clone)]
 pub struct SearchStats {
     pub nodes: u64,
+    pub tt_hits: u64,
 }
 
 /// Result returned by `Searcher::search_timed` after iterative deepening.
@@ -213,14 +218,15 @@ pub struct SearchResult {
 }
 
 /// The search engine.  Owns mutable state that would be awkward to thread
-/// through bare recursive functions: stats, move-ordering flag, and the
-/// PV move carried across iterative-deepening iterations.
+/// through bare recursive functions: stats, move-ordering flag, the
+/// PV move carried across iterative-deepening iterations, and the TT.
 pub struct Searcher {
     pub stats: SearchStats,
     /// When true, moves are scored and sorted before each alpha-beta expansion.
     pub use_move_ordering: bool,
     /// Best move from the previous iteration; seeded into root move ordering.
     pv_move: Option<Move>,
+    tt: TranspositionTable,
 }
 
 impl Searcher {
@@ -229,6 +235,7 @@ impl Searcher {
             stats: SearchStats::default(),
             use_move_ordering: true,
             pv_move: None,
+            tt: TranspositionTable::new(DEFAULT_TT_MB),
         }
     }
 
@@ -239,10 +246,11 @@ impl Searcher {
             stats: SearchStats::default(),
             use_move_ordering: false,
             pv_move: None,
+            tt: TranspositionTable::new(DEFAULT_TT_MB),
         }
     }
 
-    /// Negamax with alpha-beta pruning (fail-hard).
+    /// Negamax with alpha-beta pruning (fail-hard) and transposition table.
     ///
     /// `alpha` – lower bound on the score we can guarantee (maximiser's floor).
     /// `beta`  – upper bound the opponent will allow (cut-off when score ≥ beta).
@@ -255,6 +263,14 @@ impl Searcher {
             return eval(board);
         }
 
+        // TT probe — may yield an immediate score cut or a move for ordering.
+        let orig_alpha = alpha;
+        let (score_cut, tt_move) = self.tt.probe(board.hash, depth as u8, alpha, beta);
+        if let Some(score) = score_cut {
+            self.stats.tt_hits += 1;
+            return score;
+        }
+
         let mut moves = Vec::with_capacity(128);
         generate_legal_moves(board, &mut moves);
 
@@ -262,22 +278,43 @@ impl Searcher {
             return -MATE_SCORE;
         }
 
+        // Move ordering: TT move first, then heuristic sort on the rest.
+        let rest_start = if let Some(tt_mv) = tt_move {
+            if let Some(pos) = moves.iter().position(|&m| m == tt_mv) {
+                moves.swap(0, pos);
+                1
+            } else {
+                0
+            }
+        } else {
+            0
+        };
         if self.use_move_ordering {
-            order_moves(&mut moves, board);
+            order_moves(&mut moves[rest_start..], board);
         }
 
-        for mv in moves {
+        let mut best_move = moves[0];
+        for mv in &moves {
+            let mv = *mv;
             let undo = make_move_full(board, mv);
             let score = -self.alpha_beta(board, depth - 1, -beta, -alpha);
             unmake_move_full(board, mv, &undo);
 
             if score >= beta {
-                return beta; // fail-hard beta cut-off
+                // Fail-high: store as lower bound, return beta (fail-hard).
+                self.tt.store(board.hash, depth as u8, beta, Bound::Lower, Some(mv));
+                return beta;
             }
             if score > alpha {
                 alpha = score;
+                best_move = mv;
             }
         }
+
+        // Determine bound type based on whether alpha improved.
+        let bound = if alpha > orig_alpha { Bound::Exact } else { Bound::Upper };
+        self.tt.store(board.hash, depth as u8, alpha, bound, Some(best_move));
+
         alpha
     }
 
@@ -367,8 +404,9 @@ impl Searcher {
 
             // Emit a USI info line for this depth.
             println!(
-                "info depth {depth} score cp {score} nodes {} time {elapsed_ms} pv {}",
+                "info depth {depth} score cp {score} nodes {} time {elapsed_ms} hashfull {} pv {}",
                 self.stats.nodes,
+                self.stats.tt_hits,
                 mv.to_usi_string()
             );
             io::stdout().flush().ok();
@@ -730,6 +768,77 @@ mod tests {
             deep.depth >= shallow.depth,
             "more time should reach equal or greater depth"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // transposition table
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tt_reduces_nodes_on_repeated_search() {
+        // A warm TT should reduce nodes vs a completely fresh one when
+        // searching the same position at the same depth a second time.
+        let mut board = Board::startpos();
+
+        // First search — cold TT
+        let mut s1 = Searcher::new();
+        s1.search(&mut board, 4);
+        let cold_nodes = s1.stats.nodes;
+
+        // Second search on the same Searcher (TT is warm)
+        s1.stats = SearchStats::default();
+        s1.pv_move = None;
+        s1.search(&mut board, 4);
+        let warm_nodes = s1.stats.nodes;
+
+        assert!(
+            warm_nodes < cold_nodes,
+            "warm TT ({warm_nodes} nodes) should visit fewer nodes than cold ({cold_nodes})"
+        );
+    }
+
+    #[test]
+    fn test_tt_hits_nonzero_after_warm_search() {
+        let mut board = Board::startpos();
+        let mut s = Searcher::new();
+        s.search(&mut board, 3);
+        // Reset stats but keep TT warm
+        s.stats = SearchStats::default();
+        s.pv_move = None;
+        s.search(&mut board, 3);
+        assert!(
+            s.stats.tt_hits > 0,
+            "a warm TT should register hits on a repeated search"
+        );
+    }
+
+    #[test]
+    fn test_tt_does_not_change_score() {
+        // The TT must not change the score returned by alpha-beta.
+        let mut board = Board::startpos();
+
+        let (_, fresh_score) = Searcher::new().search(&mut board, 4).unwrap();
+
+        let mut s = Searcher::new();
+        s.search(&mut board, 4);
+        // Re-search with warm TT
+        s.stats = SearchStats::default();
+        s.pv_move = None;
+        let (_, warm_score) = s.search(&mut board, 4).unwrap();
+
+        assert_eq!(
+            fresh_score, warm_score,
+            "TT must not change the score at any depth"
+        );
+    }
+
+    #[test]
+    fn test_tt_score_matches_minimax_depth3() {
+        // Depth-3 alpha-beta with TT must match plain minimax score.
+        let mut board = Board::startpos();
+        let (_, mm_score) = minimax(&mut board, 3).unwrap();
+        let (_, ab_score) = Searcher::new().search(&mut board, 3).unwrap();
+        assert_eq!(mm_score, ab_score, "TT-enabled alpha-beta must match minimax");
     }
 
     #[test]

@@ -6,5 +6,6 @@ pub mod board;
 pub mod moves;
 pub mod movegen;
 pub mod perft;
+pub mod tt;
 pub mod search;
 pub mod usi;
