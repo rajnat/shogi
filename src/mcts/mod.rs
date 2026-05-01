@@ -121,6 +121,44 @@ impl Arena {
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
+
+    /// Select the child of `parent_idx` with the highest PUCT score.
+    ///
+    /// Uses the AlphaZero PUCT formula:
+    ///
+    /// ```text
+    /// PUCT(s, a) = Q(s, a) + c_puct · P(s, a) · √N(s) / (1 + N(s, a))
+    /// ```
+    ///
+    /// where Q = mean value, P = prior, N(s) = parent visits, N(s,a) = child visits.
+    /// High `c_puct` favours exploration (prior-guided); low values favour exploitation (Q).
+    ///
+    /// Returns `None` if the parent has no children (unexpanded leaf).
+    pub fn best_child(&self, parent_idx: NodeIdx, c_puct: f32) -> Option<NodeIdx> {
+        let parent = self.get(parent_idx);
+        if parent.children.is_empty() {
+            return None;
+        }
+        let sqrt_n = (parent.visit_count as f32).sqrt();
+        parent
+            .children
+            .iter()
+            .copied()
+            .max_by(|&a, &b| {
+                let sa = self.puct_score(a, sqrt_n, c_puct);
+                let sb = self.puct_score(b, sqrt_n, c_puct);
+                // unwrap_or keeps behaviour deterministic if a score is NaN
+                sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+            })
+    }
+
+    #[inline]
+    fn puct_score(&self, idx: NodeIdx, sqrt_parent_n: f32, c_puct: f32) -> f32 {
+        let node = self.get(idx);
+        let q = node.mean_value();
+        let u = c_puct * node.prior * sqrt_parent_n / (1.0 + node.visit_count as f32);
+        q + u
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -240,5 +278,78 @@ mod tests {
         let idx = arena.alloc(Node::new(None, 0.9, NO_PARENT));
         assert_eq!(idx, 0); // index resets to 0 after clear
         assert!((arena.get(0).prior - 0.9).abs() < 1e-6);
+    }
+
+    // --- PUCT / best_child tests ---
+
+    // Build a root + two children, returning (arena, root, child_a, child_b).
+    fn two_child_arena(
+        prior_a: f32, visits_a: u32, value_a: f32,
+        prior_b: f32, visits_b: u32, value_b: f32,
+        parent_visits: u32,
+    ) -> (Arena, NodeIdx, NodeIdx, NodeIdx) {
+        let mut arena = Arena::new(8);
+        let root = arena.alloc(Node::new(None, 1.0, NO_PARENT));
+        let ca   = arena.alloc(Node::new(None, prior_a, root));
+        let cb   = arena.alloc(Node::new(None, prior_b, root));
+        arena.get_mut(ca).visit_count  = visits_a;
+        arena.get_mut(ca).total_value  = value_a;
+        arena.get_mut(cb).visit_count  = visits_b;
+        arena.get_mut(cb).total_value  = value_b;
+        arena.get_mut(root).visit_count = parent_visits;
+        arena.get_mut(root).children.push(ca);
+        arena.get_mut(root).children.push(cb);
+        (arena, root, ca, cb)
+    }
+
+    #[test]
+    fn test_best_child_none_for_leaf() {
+        let mut arena = Arena::new(4);
+        let root = arena.alloc(Node::new(None, 1.0, NO_PARENT));
+        assert!(arena.best_child(root, 1.0).is_none());
+    }
+
+    #[test]
+    fn test_best_child_prefers_higher_prior_when_unvisited() {
+        // Both children unvisited: the one with higher prior should win.
+        let (arena, root, _ca, cb) =
+            two_child_arena(0.3, 0, 0.0, 0.7, 0, 0.0, 5);
+        assert_eq!(arena.best_child(root, 1.0), Some(cb));
+    }
+
+    #[test]
+    fn test_best_child_exploitation_beats_prior_at_low_c_puct() {
+        // Child A: prior=0.3, visits=10, Q=0.8  (good but low prior)
+        // Child B: prior=0.7, visits=0,  Q=0.0  (high prior, unvisited)
+        // At low c_puct the high Q of A should dominate.
+        let (arena, root, ca, _cb) =
+            two_child_arena(0.3, 10, 8.0,  0.7, 0, 0.0,  10);
+        assert_eq!(arena.best_child(root, 0.1), Some(ca));
+    }
+
+    #[test]
+    fn test_best_child_exploration_beats_q_at_high_c_puct() {
+        // Same setup — at high c_puct the unvisited high-prior child B wins.
+        let (arena, root, _ca, cb) =
+            two_child_arena(0.3, 10, 8.0,  0.7, 0, 0.0,  10);
+        assert_eq!(arena.best_child(root, 5.0), Some(cb));
+    }
+
+    #[test]
+    fn test_puct_score_manual() {
+        // Single child: prior=0.6, visits=4, total_value=2.0 → Q=0.5
+        // Parent visits=9 → sqrt=3.0
+        // U = 1.0 * 0.6 * 3.0 / (1+4) = 0.36
+        // PUCT = 0.5 + 0.36 = 0.86
+        let mut arena = Arena::new(4);
+        let root = arena.alloc(Node::new(None, 1.0, NO_PARENT));
+        let child = arena.alloc(Node::new(None, 0.6, root));
+        arena.get_mut(child).visit_count = 4;
+        arena.get_mut(child).total_value = 2.0;
+        arena.get_mut(root).visit_count = 9;
+        arena.get_mut(root).children.push(child);
+
+        let score = arena.puct_score(child, 3.0, 1.0);
+        assert!((score - 0.86).abs() < 1e-5, "expected 0.86, got {score}");
     }
 }
