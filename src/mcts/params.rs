@@ -37,6 +37,17 @@ pub struct MctsConfig {
     /// AlphaZero uses τ=1 for the first ~30 moves of each self-play game,
     /// then drops to τ→0. Default: 0.0 (greedy).
     pub temperature: f32,
+
+    /// Number of leaf positions accumulated before batch evaluation fires.
+    ///
+    /// Each search round collects exactly `batch_size` leaves, evaluates them
+    /// together (one GPU call in M5; parallel rollouts now), then backprops all
+    /// results in a single lock acquisition.
+    ///
+    /// Set to 1 to evaluate each leaf immediately (equivalent to the pre-batch
+    /// behaviour).  Larger values amortize the fixed cost of a neural-net
+    /// forward pass across more positions.  Default: 8.
+    pub batch_size: usize,
 }
 
 impl Default for MctsConfig {
@@ -48,6 +59,7 @@ impl Default for MctsConfig {
             dirichlet_epsilon: 0.25,
             dirichlet_noise: false,
             temperature: 0.0,
+            batch_size: 8,
         }
     }
 }
@@ -74,6 +86,7 @@ mod tests {
         assert!((cfg.dirichlet_alpha - 0.15).abs() < 1e-6);
         assert!((cfg.dirichlet_epsilon - 0.25).abs() < 1e-6);
         assert!(!cfg.dirichlet_noise);
+        assert_eq!(cfg.batch_size, 8);
     }
 
     #[test]

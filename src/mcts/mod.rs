@@ -6,8 +6,10 @@
 /// moved into this node, −1 = loss.
 pub mod search;
 pub mod params;
+pub mod batch;
 
 pub use params::MctsConfig;
+pub use batch::{LeafBatch, PendingLeaf};
 
 use crate::types::Move;
 
