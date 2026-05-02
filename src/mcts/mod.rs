@@ -9,7 +9,7 @@ pub mod params;
 pub mod batch;
 
 pub use params::MctsConfig;
-pub use batch::{LeafBatch, PendingLeaf};
+pub use batch::{BatchChannel, LeafBatch, PendingLeaf};
 
 use crate::types::Move;
 

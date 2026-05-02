@@ -5,7 +5,7 @@ use rand::distributions::WeightedIndex;
 use rand::seq::SliceRandom;
 use rand_distr::{Distribution, Gamma};
 use rayon::prelude::*;
-use super::batch::PendingLeaf;
+use super::batch::BatchChannel;
 use crate::board::Board;
 use crate::movegen::generate_legal_moves;
 use crate::moves::{make_move_full, unmake_move_full, UndoState};
@@ -366,15 +366,21 @@ pub fn mcts_search<R: Rng>(
 // Parallel simulation loop
 // ---------------------------------------------------------------------------
 
-/// Run `num_simulations` MCTS iterations using batched leaf evaluation.
+/// Run `num_simulations` MCTS iterations with signal-based batched evaluation.
 ///
-/// Simulations are grouped into rounds of `config.batch_size`.  Each round:
+/// Workers (rayon tasks) and the evaluator (calling thread) communicate through
+/// a [`BatchChannel`]:
 ///
-/// 1. **Collect** — `batch_size` workers run select + apply-VL + expand in
-///    parallel, each depositing a `PendingLeaf` into a local batch.
-/// 2. **Evaluate** — all non-terminal leaves in the batch are evaluated
-///    together (parallel rollouts now; one GPU call once M5 plugs in a net).
-/// 3. **Backprop** — all results are written back in a single lock acquisition.
+/// - **Workers** run select + apply-VL + expand, deposit the leaf board via
+///   [`BatchChannel::deposit`], and block in [`BatchChannel::wait_for_result`].
+///   When the deposit fills the batch the evaluator is signalled automatically.
+/// - **Evaluator** (this thread) loops on [`BatchChannel::wait_for_batch`],
+///   scores all boards in the batch at once, and calls
+///   [`BatchChannel::post_results`] to wake the waiting workers.
+/// - Workers unblock, read their score, and backprop.
+///
+/// In M5 the `rollout` call inside the evaluator loop becomes a single neural-
+/// network forward pass on a stacked `[N, 119, 9, 9]` tensor.
 ///
 /// Returns `None` only if the root has no legal moves.
 pub fn mcts_search_parallel(
@@ -384,6 +390,7 @@ pub fn mcts_search_parallel(
     num_threads: usize,
 ) -> Option<Move> {
     let arena: Arc<Mutex<Arena>> = Arc::new(Mutex::new(Arena::new(500_000)));
+    let channel = BatchChannel::new(config.batch_size);
     const ROOT: NodeIdx = 0;
 
     // Single-threaded setup: allocate root, expand, optional Dirichlet noise.
@@ -399,84 +406,96 @@ pub fn mcts_search_parallel(
         }
     }
 
-    // Build a thread pool respecting the caller's num_threads preference.
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(num_threads.max(1))
         .build()
         .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
 
-    let total     = num_simulations as usize;
-    let batch_cap = config.batch_size.max(1);
-    let mut done  = 0;
+    // --- Worker thread ---
+    //
+    // Spawns rayon tasks for every simulation.  Each task:
+    //   1. Selects a leaf (locked) and applies virtual loss.
+    //   2. Expands the leaf (locked).
+    //   3. Deposits the leaf board into the channel and blocks.
+    //   4. On wake-up, backprops its result (locked).
+    //
+    // After all tasks finish, signals the channel to flush any partial batch.
+    let arena_w   = Arc::clone(&arena);
+    let channel_w = Arc::clone(&channel);
+    let board_w   = board.clone();
+    let config_w  = config.clone();
 
-    while done < total {
-        let this_batch = batch_cap.min(total - done);
-
-        // --- Step 1: collect leaves in parallel ---
-        //
-        // Each rayon task runs the three locked phases (select/VL, expand) and
-        // deposits a PendingLeaf.  The expensive evaluation is deferred.
-        let batch: Vec<PendingLeaf> = pool.install(|| {
-            (0..this_batch)
+    let worker_thread = std::thread::spawn(move || {
+        pool.install(|| {
+            (0..num_simulations as usize)
                 .into_par_iter()
-                .map(|_| {
-                    // Phase 1 (locked): select, compute path, apply VL.
+                .for_each(|_| {
+                    // Phase 1 (locked): select, path, apply VL.
                     let (leaf, move_list, vl_path) = {
-                        let mut a = arena.lock().unwrap();
-                        let mut tmp = board.clone();
-                        let (leaf, undo) = select(&a, ROOT, &mut tmp, config.c_puct);
+                        let mut a = arena_w.lock().unwrap();
+                        let mut tmp = board_w.clone();
+                        let (leaf, undo) = select(&a, ROOT, &mut tmp, config_w.c_puct);
                         let path = path_to_root(&a, leaf);
                         apply_virtual_loss(&mut a, &path);
                         let moves: Vec<Move> = undo.into_iter().map(|(mv, _)| mv).collect();
                         (leaf, moves, path)
                     };
 
-                    // Reproduce the leaf board position (lock-free).
-                    let mut leaf_board = board.clone();
+                    // Reproduce leaf board (lock-free).
+                    let mut leaf_board = board_w.clone();
                     for &mv in &move_list {
                         make_move_full(&mut leaf_board, mv);
                     }
 
-                    // Phase 2 (locked): expand the leaf.
+                    // Phase 2 (locked): expand.
                     let is_terminal = {
-                        let mut a = arena.lock().unwrap();
+                        let mut a = arena_w.lock().unwrap();
                         !expand(&mut a, leaf, &mut leaf_board)
                     };
 
-                    PendingLeaf { leaf, board: leaf_board, vl_path, is_terminal }
-                })
-                .collect()
-        });
+                    // Deposit into the channel and block until evaluated.
+                    let (slot, epoch) = channel_w.deposit(leaf_board, is_terminal);
+                    let value        = channel_w.wait_for_result(slot, epoch);
 
-        // --- Step 2: evaluate the whole batch at once ---
-        //
-        // Non-terminal leaves are evaluated in parallel.  Terminal leaves get
-        // −1.0 (side to move has no moves = they lose) without any evaluation.
-        // In M5 this becomes a single neural-net forward pass on a stacked tensor.
-        let values: Vec<f32> = pool.install(|| {
-            batch
-                .par_iter()
-                .map(|p| {
-                    if p.is_terminal {
-                        -1.0
-                    } else {
-                        rollout(&p.board, &mut rand::thread_rng(), config.rollout_depth)
+                    // Phase 3 (locked): remove VL and backprop.
+                    {
+                        let mut a = arena_w.lock().unwrap();
+                        remove_virtual_loss(&mut a, &vl_path);
+                        backprop(&mut a, leaf, value);
                     }
-                })
-                .collect()
+                });
         });
+        // All simulations done — flush any partial batch and shut down.
+        channel_w.close();
+    });
 
-        // --- Step 3: backprop all results in one lock acquisition ---
-        {
-            let mut a = arena.lock().unwrap();
-            for (p, &value) in batch.iter().zip(values.iter()) {
-                remove_virtual_loss(&mut a, &p.vl_path);
-                backprop(&mut a, p.leaf, value);
+    // --- Evaluator loop (this thread) ---
+    //
+    // Blocks on wait_for_batch until the channel signals that a full batch (or
+    // a flushed partial batch) is ready, then scores all boards together.
+    // In M5: replace the par_iter rollouts with one net.forward() call.
+    let rollout_depth = config.rollout_depth;
+    loop {
+        match channel.wait_for_batch(std::time::Duration::from_millis(1)) {
+            None => break, // channel closed, all work done
+            Some((boards, terminals)) => {
+                let values: Vec<f32> = boards
+                    .par_iter()
+                    .zip(terminals.par_iter())
+                    .map(|(b, &is_term)| {
+                        if is_term {
+                            -1.0
+                        } else {
+                            rollout(b, &mut rand::thread_rng(), rollout_depth)
+                        }
+                    })
+                    .collect();
+                channel.post_results(values);
             }
         }
-
-        done += this_batch;
     }
+
+    worker_thread.join().expect("worker thread panicked");
 
     let a = arena.lock().unwrap();
     select_move_by_temperature(&a, ROOT, config.temperature, &mut rand::thread_rng())
