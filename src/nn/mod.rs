@@ -1,8 +1,7 @@
 /// Neural network: policy + value head for AlphaZero-style MCTS.
-///
-/// M5-01: tch-rs setup and device detection.
-/// Subsequent submodules add the encoder, ResBlock, and full network.
 pub use tch::Device;
+pub mod encoder;
+pub use encoder::{encode, NUM_PLANES, HAND_MAX};
 
 /// Return the device to use for all tensor ops.
 ///
