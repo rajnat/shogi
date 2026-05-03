@@ -13,6 +13,7 @@ rand_distr = "0.4"
 rayon = "1"
 clap = { version = "4", features = ["derive"] }
 lazy_static = "1"
+tch = "0.24"
 
 [profile.release]
 opt-level = 3

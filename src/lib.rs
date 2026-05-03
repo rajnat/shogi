@@ -11,3 +11,4 @@ pub mod eval;
 pub mod search;
 pub mod usi;
 pub mod mcts;
+pub mod nn;
