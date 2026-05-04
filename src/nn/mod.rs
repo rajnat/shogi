@@ -21,26 +21,29 @@ mod tests {
     use super::*;
     use tch::Tensor;
 
+    fn copy_to_vec(t: &Tensor) -> Vec<f32> {
+        let n = t.numel();
+        let mut out = vec![0.0f32; n];
+        t.copy_data(&mut out, n);
+        out
+    }
+
     #[test]
     fn test_device_is_valid() {
         let d = device();
-        // Must be either Cpu or a Cuda device — no panic means linkage is good.
         let _ = d;
     }
 
     #[test]
     fn test_tensor_add() {
-        // Basic sanity check that LibTorch is linked and ops work.
         let a = Tensor::from_slice(&[1.0_f32, 2.0, 3.0]);
         let b = Tensor::from_slice(&[4.0_f32, 5.0, 6.0]);
         let c = a + b;
-        let vals: Vec<f32> = c.into();
-        assert_eq!(vals, vec![5.0, 7.0, 9.0]);
+        assert_eq!(copy_to_vec(&c), vec![5.0, 7.0, 9.0]);
     }
 
     #[test]
     fn test_tensor_matmul_shape() {
-        // 2×3 @ 3×4 → 2×4
         let a = Tensor::randn([2, 3], (tch::Kind::Float, device()));
         let b = Tensor::randn([3, 4], (tch::Kind::Float, device()));
         let c = a.matmul(&b);
@@ -51,7 +54,6 @@ mod tests {
     fn test_tensor_relu() {
         let t = Tensor::from_slice(&[-1.0_f32, 0.0, 1.0, 2.0]);
         let r = t.relu();
-        let vals: Vec<f32> = r.into();
-        assert_eq!(vals, vec![0.0, 0.0, 1.0, 2.0]);
+        assert_eq!(copy_to_vec(&r), vec![0.0, 0.0, 1.0, 2.0]);
     }
 }
