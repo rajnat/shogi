@@ -2,6 +2,8 @@
 pub use tch::Device;
 pub mod encoder;
 pub use encoder::{encode, NUM_PLANES, HAND_MAX};
+pub mod resblock;
+pub use resblock::ResBlock;
 
 /// Return the device to use for all tensor ops.
 ///
