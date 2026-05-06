@@ -1,3 +1,5 @@
+use super::NodeIdx;
+use crate::board::Board;
 /// Batch accumulator and signal channel for leaf evaluation.
 ///
 /// Instead of evaluating each MCTS leaf immediately (one rollout / one network
@@ -5,8 +7,6 @@
 /// `capacity`, the caller evaluates all non-terminal positions together — one
 /// GPU forward pass in M5, parallel rollouts now — and backprops all results.
 use std::sync::{Arc, Condvar, Mutex};
-use crate::board::Board;
-use super::NodeIdx;
 
 // ---------------------------------------------------------------------------
 // PendingLeaf
@@ -25,13 +25,22 @@ pub struct PendingLeaf {
     pub is_terminal: bool,
 }
 
+/// Evaluator result for a single leaf.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EvalResult {
+    /// Raw policy logits aligned to the canonical move-index space.
+    pub policy_logits: Vec<f32>,
+    /// Scalar value in [-1, 1] from the perspective of the leaf side to move.
+    pub value: f32,
+}
+
 // ---------------------------------------------------------------------------
 // LeafBatch
 // ---------------------------------------------------------------------------
 
 /// Fixed-capacity accumulator for leaf positions.
 pub struct LeafBatch {
-    pending:  Vec<PendingLeaf>,
+    pending: Vec<PendingLeaf>,
     capacity: usize,
 }
 
@@ -41,20 +50,19 @@ impl LeafBatch {
     pub fn new(capacity: usize) -> Self {
         let cap = capacity.max(1);
         LeafBatch {
-            pending:  Vec::with_capacity(cap),
+            pending: Vec::with_capacity(cap),
             capacity: cap,
         }
     }
 
     /// Deposit one leaf into the batch.
-    pub fn push(
-        &mut self,
-        leaf:        NodeIdx,
-        board:       Board,
-        vl_path:     Vec<NodeIdx>,
-        is_terminal: bool,
-    ) {
-        self.pending.push(PendingLeaf { leaf, board, vl_path, is_terminal });
+    pub fn push(&mut self, leaf: NodeIdx, board: Board, vl_path: Vec<NodeIdx>, is_terminal: bool) {
+        self.pending.push(PendingLeaf {
+            leaf,
+            board,
+            vl_path,
+            is_terminal,
+        });
     }
 
     /// True when the batch has reached its capacity and is ready to evaluate.
@@ -109,35 +117,35 @@ enum Phase {
 }
 
 struct ChannelState {
-    boards:     Vec<Board>,
-    terminals:  Vec<bool>,
-    capacity:   usize,
-    /// Scores for the last evaluated batch (indexed by deposit order).
-    values:     Vec<f32>,
+    boards: Vec<Board>,
+    terminals: Vec<bool>,
+    capacity: usize,
+    /// Evaluator outputs for the last evaluated batch (indexed by deposit order).
+    results: Vec<EvalResult>,
     /// Workers that have consumed their result in the current Consuming phase.
-    consumed:   usize,
+    consumed: usize,
     /// Size of the batch currently in Consuming phase.
-    batch_len:  usize,
+    batch_len: usize,
     /// Incremented every time `post_results` is called.
     generation: u64,
-    phase:      Phase,
+    phase: Phase,
     /// Set by `close()` after all deposits are done.
-    closed:     bool,
+    closed: bool,
 }
 
 impl ChannelState {
     fn new(capacity: usize) -> Self {
         let cap = capacity.max(1);
         ChannelState {
-            boards:     Vec::with_capacity(cap),
-            terminals:  Vec::with_capacity(cap),
-            capacity:   cap,
-            values:     Vec::new(),
-            consumed:   0,
-            batch_len:  0,
+            boards: Vec::with_capacity(cap),
+            terminals: Vec::with_capacity(cap),
+            capacity: cap,
+            results: Vec::new(),
+            consumed: 0,
+            batch_len: 0,
             generation: 0,
-            phase:      Phase::Filling,
-            closed:     false,
+            phase: Phase::Filling,
+            closed: false,
         }
     }
 }
@@ -165,9 +173,9 @@ impl ChannelState {
 /// **Shutdown**: call [`close`] after all deposits are done (e.g., after the
 /// rayon `for_each` returns).  Any partial batch is flushed first.
 pub struct BatchChannel {
-    state:        Mutex<ChannelState>,
+    state: Mutex<ChannelState>,
     /// Evaluator sleeps here; workers wake it when the batch is full.
-    eval_ready:   Condvar,
+    eval_ready: Condvar,
     /// Workers sleep here for results; last consumer wakes workers waiting on
     /// Filling; evaluator not involved in this condvar.
     phase_change: Condvar,
@@ -176,8 +184,8 @@ pub struct BatchChannel {
 impl BatchChannel {
     pub fn new(capacity: usize) -> Arc<Self> {
         Arc::new(BatchChannel {
-            state:        Mutex::new(ChannelState::new(capacity)),
-            eval_ready:   Condvar::new(),
+            state: Mutex::new(ChannelState::new(capacity)),
+            eval_ready: Condvar::new(),
             phase_change: Condvar::new(),
         })
     }
@@ -194,7 +202,7 @@ impl BatchChannel {
             .unwrap();
 
         let slot = s.boards.len();
-        let epoch  = s.generation;
+        let epoch = s.generation;
         s.boards.push(board);
         s.terminals.push(is_terminal);
 
@@ -211,23 +219,28 @@ impl BatchChannel {
     /// Blocks until the generation counter advances past `generation`.
     /// The last worker to consume its result transitions the channel back to
     /// Filling and wakes any workers blocked on the next deposit.
-    pub fn wait_for_result(&self, slot: usize, generation: u64) -> f32 {
+    pub fn wait_for_eval_result(&self, slot: usize, generation: u64) -> EvalResult {
         let mut s = self
             .phase_change
             .wait_while(self.state.lock().unwrap(), |s| s.generation == generation)
             .unwrap();
 
-        let value = s.values[slot];
+        let result = s.results[slot].clone();
         s.consumed += 1;
 
         if s.consumed == s.batch_len {
-            s.phase    = Phase::Filling;
+            s.phase = Phase::Filling;
             s.consumed = 0;
             drop(s);
             self.phase_change.notify_all(); // wake workers blocked on next deposit
         }
 
-        value
+        result
+    }
+
+    /// Compatibility helper returning only the scalar value.
+    pub fn wait_for_result(&self, slot: usize, generation: u64) -> f32 {
+        self.wait_for_eval_result(slot, generation).value
     }
 
     /// Evaluator: block until a batch is ready to evaluate.
@@ -239,9 +252,7 @@ impl BatchChannel {
     ///
     /// Returns `(boards, terminals)` for the batch, or `None` when the channel
     /// is closed with no pending leaves.
-    pub fn wait_for_batch(&self, timeout: std::time::Duration)
-        -> Option<(Vec<Board>, Vec<bool>)>
-    {
+    pub fn wait_for_batch(&self, timeout: std::time::Duration) -> Option<(Vec<Board>, Vec<bool>)> {
         loop {
             let (mut s, wait_result) = self
                 .eval_ready
@@ -267,7 +278,7 @@ impl BatchChannel {
                 continue; // spurious wakeup, nothing pending
             }
 
-            let mut boards    = Vec::with_capacity(s.capacity);
+            let mut boards = Vec::with_capacity(s.capacity);
             let mut terminals = Vec::with_capacity(s.capacity);
             std::mem::swap(&mut s.boards, &mut boards);
             std::mem::swap(&mut s.terminals, &mut terminals);
@@ -275,18 +286,30 @@ impl BatchChannel {
         }
     }
 
-    /// Evaluator: post scores for the batch returned by [`wait_for_batch`].
+    /// Evaluator: post full eval results for the batch returned by [`wait_for_batch`].
     ///
-    /// `values[i]` is the score for the board at slot `i`.
+    /// `results[i]` is the policy/value output for the board at slot `i`.
     /// All workers blocked in [`wait_for_result`] are notified.
-    pub fn post_results(&self, values: Vec<f32>) {
+    pub fn post_eval_results(&self, results: Vec<EvalResult>) {
         let mut s = self.state.lock().unwrap();
-        s.batch_len = values.len();
-        s.values    = values;
+        s.batch_len = results.len();
+        s.results = results;
         s.generation += 1;
         s.phase = Phase::Consuming;
         drop(s);
         self.phase_change.notify_all();
+    }
+
+    /// Compatibility helper posting value-only results.
+    pub fn post_results(&self, values: Vec<f32>) {
+        let results: Vec<EvalResult> = values
+            .into_iter()
+            .map(|value| EvalResult {
+                policy_logits: Vec::new(),
+                value,
+            })
+            .collect();
+        self.post_eval_results(results);
     }
 
     /// Signal that no more deposits will be made.
@@ -529,15 +552,17 @@ mod tests {
         let ch = BatchChannel::new(2);
 
         let ch_eval = Arc::clone(&ch);
-        std::thread::spawn(move || loop {
-            match ch_eval.wait_for_batch(std::time::Duration::from_millis(5)) {
-                None => break,
-                Some((boards, _)) => {
-                    // slot 0 → 1.0, slot 1 → -1.0
-                    let v: Vec<f32> = (0..boards.len())
-                        .map(|i| if i == 0 { 1.0 } else { -1.0 })
-                        .collect();
-                    ch_eval.post_results(v);
+        std::thread::spawn(move || {
+            loop {
+                match ch_eval.wait_for_batch(std::time::Duration::from_millis(5)) {
+                    None => break,
+                    Some((boards, _)) => {
+                        // slot 0 → 1.0, slot 1 → -1.0
+                        let v: Vec<f32> = (0..boards.len())
+                            .map(|i| if i == 0 { 1.0 } else { -1.0 })
+                            .collect();
+                        ch_eval.post_results(v);
+                    }
                 }
             }
         });
@@ -549,17 +574,56 @@ mod tests {
         let v1 = ch.wait_for_result(s1, g);
         ch.close();
 
-        assert!((v0 - 1.0).abs() < 1e-6,  "slot 0 should get 1.0, got {v0}");
+        assert!((v0 - 1.0).abs() < 1e-6, "slot 0 should get 1.0, got {v0}");
         assert!((v1 - -1.0).abs() < 1e-6, "slot 1 should get -1.0, got {v1}");
+    }
+
+    #[test]
+    fn test_channel_eval_results_round_trip() {
+        let ch = BatchChannel::new(2);
+
+        let ch_eval = Arc::clone(&ch);
+        std::thread::spawn(move || {
+            loop {
+                match ch_eval.wait_for_batch(std::time::Duration::from_millis(5)) {
+                    None => break,
+                    Some((boards, _)) => {
+                        let results: Vec<EvalResult> = (0..boards.len())
+                            .map(|i| EvalResult {
+                                policy_logits: vec![i as f32, (i + 10) as f32],
+                                value: if i == 0 { 1.0 } else { -1.0 },
+                            })
+                            .collect();
+                        ch_eval.post_eval_results(results);
+                    }
+                }
+            }
+        });
+
+        let (s0, g) = ch.deposit(Board::startpos(), false);
+        let (s1, _) = ch.deposit(Board::startpos(), false);
+
+        let r0 = ch.wait_for_eval_result(s0, g);
+        let r1 = ch.wait_for_eval_result(s1, g);
+        ch.close();
+
+        assert_eq!(r0.policy_logits, vec![0.0, 10.0]);
+        assert!((r0.value - 1.0).abs() < 1e-6);
+        assert_eq!(r1.policy_logits, vec![1.0, 11.0]);
+        assert!((r1.value - -1.0).abs() < 1e-6);
     }
 
     #[test]
     fn test_channel_close_empty_returns_none() {
         let ch = BatchChannel::new(4);
         let ch_eval = Arc::clone(&ch);
-        let eval = std::thread::spawn(move || ch_eval.wait_for_batch(std::time::Duration::from_millis(5)));
+        let eval =
+            std::thread::spawn(move || ch_eval.wait_for_batch(std::time::Duration::from_millis(5)));
         ch.close();
         let result = eval.join().unwrap();
-        assert!(result.is_none(), "empty close must return None to evaluator");
+        assert!(
+            result.is_none(),
+            "empty close must return None to evaluator"
+        );
     }
 }
