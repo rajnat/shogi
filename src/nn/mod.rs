@@ -5,7 +5,7 @@ pub use encoder::{encode, NUM_PLANES, HAND_MAX};
 pub mod resblock;
 pub use resblock::ResBlock;
 pub mod move_index;
-pub use move_index::{move_to_index, index_to_move, NUM_ACTIONS};
+pub use move_index::{move_to_index, index_to_move, index_to_move_on_board, NUM_ACTIONS};
 pub mod net;
 pub use net::Net;
 
