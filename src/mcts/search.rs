@@ -3,7 +3,7 @@ use super::{Arena, MctsConfig, NO_PARENT, Node, NodeIdx};
 use crate::board::Board;
 use crate::movegen::generate_legal_moves;
 use crate::moves::{UndoState, make_move_full, unmake_move_full};
-use crate::nn::{NUM_ACTIONS, move_to_index};
+use crate::nn::{NUM_ACTIONS, Net, encode, move_to_index};
 use crate::types::{Color, Move};
 use rand::Rng;
 use rand::distributions::WeightedIndex;
@@ -154,6 +154,52 @@ pub fn expand_with_policy(
     }
 
     true
+}
+
+/// Evaluate one board with the neural network, returning raw policy logits and value.
+pub fn eval_with_net(net: &Net, device: tch::Device, board: &Board) -> super::batch::EvalResult {
+    let input = encode(board).unsqueeze(0).to_device(device);
+    let (policy, value) = net.forward_t(&input, false);
+
+    let policy = policy.squeeze_dim(0).to_device(tch::Device::Cpu);
+    let mut policy_logits = vec![0.0_f32; NUM_ACTIONS];
+    policy.copy_data(&mut policy_logits, NUM_ACTIONS);
+
+    let value = value.to_device(tch::Device::Cpu).double_value(&[0, 0]) as f32;
+    super::batch::EvalResult {
+        policy_logits,
+        value,
+    }
+}
+
+/// Evaluate a batch of boards with the neural network.
+pub fn eval_batch_with_net(
+    net: &Net,
+    device: tch::Device,
+    boards: &[Board],
+) -> Vec<super::batch::EvalResult> {
+    if boards.is_empty() {
+        return Vec::new();
+    }
+
+    let encoded: Vec<tch::Tensor> = boards.iter().map(encode).collect();
+    let input = tch::Tensor::stack(&encoded, 0).to_device(device);
+    let (policy, value) = net.forward_t(&input, false);
+    let policy = policy.to_device(tch::Device::Cpu);
+    let value = value.to_device(tch::Device::Cpu);
+
+    let mut results = Vec::with_capacity(boards.len());
+    for i in 0..boards.len() {
+        let row = policy.get(i as i64);
+        let mut policy_logits = vec![0.0_f32; NUM_ACTIONS];
+        row.copy_data(&mut policy_logits, NUM_ACTIONS);
+        let scalar = value.double_value(&[i as i64, 0]) as f32;
+        results.push(super::batch::EvalResult {
+            policy_logits,
+            value: scalar,
+        });
+    }
+    results
 }
 
 // ---------------------------------------------------------------------------
@@ -441,6 +487,77 @@ pub fn mcts_search<R: Rng>(
     select_move_by_temperature(arena, root, config.temperature, rng)
 }
 
+pub fn mcts_search_with_evaluator<R, F>(
+    arena: &mut Arena,
+    board: &mut Board,
+    num_simulations: u32,
+    config: &MctsConfig,
+    rng: &mut R,
+    mut evaluator: F,
+) -> Option<Move>
+where
+    R: Rng,
+    F: FnMut(&Board) -> super::batch::EvalResult,
+{
+    arena.clear();
+    let root = arena.alloc(Node::new(None, 1.0, NO_PARENT));
+
+    let root_eval = evaluator(board);
+    if !expand_with_policy(arena, root, board, &root_eval.policy_logits) {
+        return None;
+    }
+
+    if config.dirichlet_noise {
+        add_dirichlet_noise(
+            arena,
+            root,
+            config.dirichlet_alpha,
+            config.dirichlet_epsilon,
+            rng,
+        );
+    }
+
+    for _ in 0..num_simulations {
+        let (leaf, undo_stack) = select(arena, root, board, config.c_puct);
+        let path = path_to_root(arena, leaf);
+        apply_virtual_loss(arena, &path);
+
+        let mut probe_moves = Vec::new();
+        generate_legal_moves(board, &mut probe_moves);
+        let value = if probe_moves.is_empty() {
+            -1.0
+        } else {
+            let eval = evaluator(board);
+            let expanded = expand_with_policy(arena, leaf, board, &eval.policy_logits);
+            debug_assert!(expanded, "non-terminal node must expand");
+            eval.value
+        };
+
+        remove_virtual_loss(arena, &path);
+        backprop(arena, leaf, value);
+
+        for (mv, undo) in undo_stack.into_iter().rev() {
+            unmake_move_full(board, mv, &undo);
+        }
+    }
+
+    select_move_by_temperature(arena, root, config.temperature, rng)
+}
+
+pub fn mcts_search_with_net<R: Rng>(
+    arena: &mut Arena,
+    board: &mut Board,
+    num_simulations: u32,
+    config: &MctsConfig,
+    rng: &mut R,
+    net: &Net,
+    device: tch::Device,
+) -> Option<Move> {
+    mcts_search_with_evaluator(arena, board, num_simulations, config, rng, |b| {
+        eval_with_net(net, device, b)
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Parallel simulation loop
 // ---------------------------------------------------------------------------
@@ -497,14 +614,6 @@ pub fn mcts_search_parallel(
         .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
 
     // --- Worker thread ---
-    //
-    // Spawns rayon tasks for every simulation.  Each task:
-    //   1. Selects a leaf (locked) and applies virtual loss.
-    //   2. Expands the leaf (locked).
-    //   3. Deposits the leaf board into the channel and blocks.
-    //   4. On wake-up, backprops its result (locked).
-    //
-    // After all tasks finish, signals the channel to flush any partial batch.
     let arena_w = Arc::clone(&arena);
     let channel_w = Arc::clone(&channel);
     let board_w = board.clone();
@@ -513,7 +622,6 @@ pub fn mcts_search_parallel(
     let worker_thread = std::thread::spawn(move || {
         pool.install(|| {
             (0..num_simulations as usize).into_par_iter().for_each(|_| {
-                // Phase 1 (locked): select, path, apply VL.
                 let (leaf, move_list, vl_path) = {
                     let mut a = arena_w.lock().unwrap();
                     let mut tmp = board_w.clone();
@@ -524,23 +632,19 @@ pub fn mcts_search_parallel(
                     (leaf, moves, path)
                 };
 
-                // Reproduce leaf board (lock-free).
                 let mut leaf_board = board_w.clone();
                 for &mv in &move_list {
                     make_move_full(&mut leaf_board, mv);
                 }
 
-                // Phase 2 (locked): expand.
                 let is_terminal = {
                     let mut a = arena_w.lock().unwrap();
                     !expand(&mut a, leaf, &mut leaf_board)
                 };
 
-                // Deposit into the channel and block until evaluated.
                 let (slot, epoch) = channel_w.deposit(leaf_board, is_terminal);
                 let value = channel_w.wait_for_result(slot, epoch);
 
-                // Phase 3 (locked): remove VL and backprop.
                 {
                     let mut a = arena_w.lock().unwrap();
                     remove_virtual_loss(&mut a, &vl_path);
@@ -548,19 +652,13 @@ pub fn mcts_search_parallel(
                 }
             });
         });
-        // All simulations done — flush any partial batch and shut down.
         channel_w.close();
     });
 
-    // --- Evaluator loop (this thread) ---
-    //
-    // Blocks on wait_for_batch until the channel signals that a full batch (or
-    // a flushed partial batch) is ready, then scores all boards together.
-    // In M5: replace the par_iter rollouts with one net.forward() call.
     let rollout_depth = config.rollout_depth;
     loop {
         match channel.wait_for_batch(std::time::Duration::from_millis(1)) {
-            None => break, // channel closed, all work done
+            None => break,
             Some((boards, terminals)) => {
                 let values: Vec<f32> = boards
                     .par_iter()
@@ -584,6 +682,136 @@ pub fn mcts_search_parallel(
     select_move_by_temperature(&a, ROOT, config.temperature, &mut rand::thread_rng())
 }
 
+pub fn mcts_search_parallel_with_evaluator<F>(
+    board: &Board,
+    num_simulations: u32,
+    config: &MctsConfig,
+    num_threads: usize,
+    evaluator: F,
+) -> Option<Move>
+where
+    F: Fn(&[Board]) -> Vec<super::batch::EvalResult>,
+{
+    let arena: Arc<Mutex<Arena>> = Arc::new(Mutex::new(Arena::new(500_000)));
+    let channel = BatchChannel::new(config.batch_size);
+    const ROOT: NodeIdx = 0;
+
+    {
+        let mut a = arena.lock().unwrap();
+        a.alloc(Node::new(None, 1.0, NO_PARENT));
+    }
+
+    let root_eval = evaluator(std::slice::from_ref(board));
+    let root_eval = root_eval
+        .into_iter()
+        .next()
+        .expect("root eval result missing");
+    {
+        let mut a = arena.lock().unwrap();
+        if !expand_with_policy(&mut a, ROOT, &mut board.clone(), &root_eval.policy_logits) {
+            return None;
+        }
+        if config.dirichlet_noise {
+            let mut rng = rand::thread_rng();
+            add_dirichlet_noise(
+                &mut a,
+                ROOT,
+                config.dirichlet_alpha,
+                config.dirichlet_epsilon,
+                &mut rng,
+            );
+        }
+    }
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads.max(1))
+        .build()
+        .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
+
+    let arena_w = Arc::clone(&arena);
+    let channel_w = Arc::clone(&channel);
+    let board_w = board.clone();
+    let config_w = config.clone();
+
+    let worker_thread = std::thread::spawn(move || {
+        pool.install(|| {
+            (0..num_simulations as usize).into_par_iter().for_each(|_| {
+                let (leaf, move_list, vl_path) = {
+                    let mut a = arena_w.lock().unwrap();
+                    let mut tmp = board_w.clone();
+                    let (leaf, undo) = select(&a, ROOT, &mut tmp, config_w.c_puct);
+                    let path = path_to_root(&a, leaf);
+                    apply_virtual_loss(&mut a, &path);
+                    let moves: Vec<Move> = undo.into_iter().map(|(mv, _)| mv).collect();
+                    (leaf, moves, path)
+                };
+
+                let mut leaf_board = board_w.clone();
+                for &mv in &move_list {
+                    make_move_full(&mut leaf_board, mv);
+                }
+
+                let mut probe_moves = Vec::new();
+                generate_legal_moves(&mut leaf_board, &mut probe_moves);
+                let is_terminal = probe_moves.is_empty();
+
+                let (slot, epoch) = channel_w.deposit(leaf_board.clone(), is_terminal);
+                let result = channel_w.wait_for_eval_result(slot, epoch);
+
+                {
+                    let mut a = arena_w.lock().unwrap();
+                    remove_virtual_loss(&mut a, &vl_path);
+                    if !is_terminal {
+                        let expanded = expand_with_policy(
+                            &mut a,
+                            leaf,
+                            &mut leaf_board,
+                            &result.policy_logits,
+                        );
+                        debug_assert!(expanded, "non-terminal node must expand");
+                    }
+                    backprop(&mut a, leaf, result.value);
+                }
+            });
+        });
+        channel_w.close();
+    });
+
+    loop {
+        match channel.wait_for_batch(std::time::Duration::from_millis(1)) {
+            None => break,
+            Some((boards, terminals)) => {
+                let mut results = evaluator(&boards);
+                for (result, &is_terminal) in results.iter_mut().zip(terminals.iter()) {
+                    if is_terminal {
+                        result.policy_logits.clear();
+                        result.value = -1.0;
+                    }
+                }
+                channel.post_eval_results(results);
+            }
+        }
+    }
+
+    worker_thread.join().expect("worker thread panicked");
+
+    let a = arena.lock().unwrap();
+    select_move_by_temperature(&a, ROOT, config.temperature, &mut rand::thread_rng())
+}
+
+pub fn mcts_search_parallel_with_net(
+    board: &Board,
+    num_simulations: u32,
+    config: &MctsConfig,
+    num_threads: usize,
+    net: &Net,
+    device: tch::Device,
+) -> Option<Move> {
+    mcts_search_parallel_with_evaluator(board, num_simulations, config, num_threads, |boards| {
+        eval_batch_with_net(net, device, boards)
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -592,10 +820,13 @@ pub fn mcts_search_parallel(
 mod tests {
     use super::*;
     use crate::board::Board;
+    use crate::mcts::batch::EvalResult;
     use crate::mcts::{MctsConfig, NO_PARENT, Node};
     use crate::movegen::generate_legal_moves;
     use crate::moves::unmake_move_full;
+    use crate::nn::checkpoint::build_with_config;
     use crate::types::PieceType;
+    use tch::Device;
 
     /// Build a root node in a fresh arena, return (arena, root_idx).
     fn make_root(board: &Board) -> (Arena, NodeIdx) {
@@ -816,6 +1047,82 @@ mod tests {
                 "illegal logits must not affect legal priors; got {p} expected {expected}"
             );
         }
+    }
+
+    fn uniform_eval_result() -> EvalResult {
+        EvalResult {
+            policy_logits: vec![0.0; NUM_ACTIONS],
+            value: 0.0,
+        }
+    }
+
+    #[test]
+    fn test_eval_with_net_returns_policy_and_value() {
+        let (_vs, net) = build_with_config(Device::Cpu, 8, 2);
+        let result = eval_with_net(&net, Device::Cpu, &Board::startpos());
+        assert_eq!(result.policy_logits.len(), NUM_ACTIONS);
+        assert!(result.policy_logits.iter().all(|v| v.is_finite()));
+        assert!(result.value.is_finite());
+        assert!(result.value > -1.0 && result.value < 1.0);
+    }
+
+    #[test]
+    fn test_mcts_search_with_evaluator_sets_root_policy_priors() {
+        let mut board = Board::startpos();
+        let mut legal = Vec::new();
+        generate_legal_moves(&mut board, &mut legal);
+        let preferred = legal[0];
+
+        let mut logits = vec![0.0_f32; NUM_ACTIONS];
+        logits[move_to_index(preferred)] = 5.0;
+
+        let mut arena = Arena::new(128);
+        let mut rng = seeded_rng(7);
+        let _ = mcts_search_with_evaluator(
+            &mut arena,
+            &mut board,
+            0,
+            &MctsConfig::default(),
+            &mut rng,
+            |_| EvalResult {
+                policy_logits: logits.clone(),
+                value: 0.0,
+            },
+        );
+
+        let mut preferred_prior = None;
+        for &child_idx in &arena.get(arena.root()).children {
+            let child = arena.get(child_idx);
+            if child.mv == Some(preferred) {
+                preferred_prior = Some(child.prior);
+                break;
+            }
+        }
+        let preferred_prior = preferred_prior.expect("preferred root child missing");
+        let uniform = 1.0 / legal.len() as f32;
+        assert!(
+            preferred_prior > uniform,
+            "expected preferred prior above uniform baseline"
+        );
+    }
+
+    #[test]
+    fn test_mcts_search_parallel_with_evaluator_returns_legal_move() {
+        let board = Board::startpos();
+        let mv = mcts_search_parallel_with_evaluator(
+            &board,
+            20,
+            &MctsConfig {
+                batch_size: 4,
+                ..MctsConfig::default()
+            },
+            2,
+            |boards| boards.iter().map(|_| uniform_eval_result()).collect(),
+        );
+        assert!(mv.is_some());
+        let mut legal = Vec::new();
+        generate_legal_moves(&mut board.clone(), &mut legal);
+        assert!(legal.contains(&mv.unwrap()));
     }
 
     #[test]
