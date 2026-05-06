@@ -8,6 +8,7 @@ pub mod move_index;
 pub use move_index::{move_to_index, index_to_move, index_to_move_on_board, NUM_ACTIONS};
 pub mod net;
 pub use net::Net;
+pub mod checkpoint;
 
 /// Return the device to use for all tensor ops.
 ///
