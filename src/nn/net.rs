@@ -19,14 +19,7 @@
 /// ```
 use tch::{nn, nn::ModuleT, Tensor};
 use super::{ResBlock, NUM_PLANES};
-
-/// Flat move-index space for the policy head.
-///
-/// Decomposition:
-///   on-board: from(81) × to(81) × promote(2) = 13 122
-///   drops:    piece_type(7) × to(81)          =    567
-/// Total: 13 689.  The exact mapping is defined in M5-05.
-pub const NUM_ACTIONS: usize = 13_689;
+use super::move_index::NUM_ACTIONS;
 
 #[derive(Debug)]
 pub struct Net {
