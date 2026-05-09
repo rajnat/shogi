@@ -1,6 +1,7 @@
 /// Training orchestration: the outer loop that coordinates self-play workers,
 /// the replay buffer, and the training thread.
 ///
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,6 +26,10 @@ pub struct OrchestrationConfig {
     pub total_steps: u64,
     /// How often to poll the buffer size while waiting for it to fill (ms).
     pub fill_poll_ms: u64,
+    /// Save a checkpoint every this many steps (0 = never).
+    pub checkpoint_every: u64,
+    /// Directory where checkpoint files are written.
+    pub checkpoint_dir: String,
 }
 
 impl Default for OrchestrationConfig {
@@ -33,8 +38,38 @@ impl Default for OrchestrationConfig {
             steps_per_broadcast: 100,
             total_steps: 0,
             fill_poll_ms: 200,
+            checkpoint_every: 1000,
+            checkpoint_dir: "checkpoints".to_string(),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Checkpointing
+// ---------------------------------------------------------------------------
+
+/// Return the path for a checkpoint at the given step.
+pub fn checkpoint_path(dir: &str, step: u64) -> PathBuf {
+    Path::new(dir).join(format!("step_{step:08}.ot"))
+}
+
+/// Save a checkpoint if `step` just crossed a `checkpoint_every` boundary.
+///
+/// A boundary is crossed when `step % checkpoint_every == 0` (and both are > 0).
+/// Creates `dir` if it does not exist.
+pub fn maybe_checkpoint(vs: &tch::nn::VarStore, step: u64, config: &OrchestrationConfig) {
+    if config.checkpoint_every == 0 || step == 0 {
+        return;
+    }
+    if step % config.checkpoint_every != 0 {
+        return;
+    }
+    let path = checkpoint_path(&config.checkpoint_dir, step);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("failed to create checkpoint dir");
+    }
+    vs.save(&path).expect("failed to save checkpoint");
+    println!("Checkpoint saved: {}", path.display());
 }
 
 // ---------------------------------------------------------------------------
@@ -105,6 +140,8 @@ pub fn run_loop<R: Rng>(
             p.broadcast_weights(&trainer.vs);
         }
 
+        maybe_checkpoint(&trainer.vs, trainer.step, config);
+
         if shutdown.load(Ordering::Relaxed) {
             return;
         }
@@ -164,6 +201,8 @@ mod tests {
             total_steps,
             steps_per_broadcast,
             fill_poll_ms: 1,
+            checkpoint_every: 0, // disabled by default in fast tests
+            checkpoint_dir: String::new(),
         }
     }
 
@@ -283,5 +322,87 @@ mod tests {
             t.step > 0,
             "should have run at least one step before shutdown"
         );
+    }
+
+    // ----- checkpoint_path -----
+
+    #[test]
+    fn test_checkpoint_path_format() {
+        let p = checkpoint_path("checkpoints", 1000);
+        assert_eq!(p, PathBuf::from("checkpoints/step_00001000.ot"));
+    }
+
+    #[test]
+    fn test_checkpoint_path_zero_padded() {
+        let p = checkpoint_path("out/ckpt", 42);
+        assert_eq!(p, PathBuf::from("out/ckpt/step_00000042.ot"));
+    }
+
+    // ----- maybe_checkpoint -----
+
+    #[test]
+    fn test_maybe_checkpoint_writes_file_at_boundary() {
+        let t = small_trainer();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = OrchestrationConfig {
+            checkpoint_every: 10,
+            checkpoint_dir: dir.path().to_str().unwrap().to_string(),
+            ..OrchestrationConfig::default()
+        };
+        // step=10 is a boundary
+        maybe_checkpoint(&t.vs, 10, &cfg);
+        let expected = dir.path().join("step_00000010.ot");
+        assert!(expected.exists(), "checkpoint file should exist at step 10");
+    }
+
+    #[test]
+    fn test_maybe_checkpoint_no_file_between_boundaries() {
+        let t = small_trainer();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = OrchestrationConfig {
+            checkpoint_every: 10,
+            checkpoint_dir: dir.path().to_str().unwrap().to_string(),
+            ..OrchestrationConfig::default()
+        };
+        maybe_checkpoint(&t.vs, 7, &cfg); // not a boundary
+        let not_expected = dir.path().join("step_00000007.ot");
+        assert!(!not_expected.exists(), "should not write file at non-boundary step");
+    }
+
+    #[test]
+    fn test_maybe_checkpoint_disabled_when_zero() {
+        let t = small_trainer();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = OrchestrationConfig {
+            checkpoint_every: 0,
+            checkpoint_dir: dir.path().to_str().unwrap().to_string(),
+            ..OrchestrationConfig::default()
+        };
+        maybe_checkpoint(&t.vs, 1000, &cfg);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "no files should be written when checkpoint_every=0"
+        );
+    }
+
+    #[test]
+    fn test_run_loop_writes_checkpoint_at_boundary() {
+        let mut t = small_trainer();
+        let buf = filled_buffer(t.min_buffer_size());
+        let mut rng = StdRng::seed_from_u64(0);
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = OrchestrationConfig {
+            total_steps: 10,
+            steps_per_broadcast: 5,
+            fill_poll_ms: 1,
+            checkpoint_every: 5,
+            checkpoint_dir: dir.path().to_str().unwrap().to_string(),
+        };
+        run_loop(&mut t, buf, None, &cfg, &mut rng, no_shutdown());
+        assert_eq!(t.step, 10);
+        // steps_per_broadcast=5, checkpoint_every=5 → checkpoints at step 5 and 10
+        assert!(dir.path().join("step_00000005.ot").exists(), "checkpoint at step 5");
+        assert!(dir.path().join("step_00000010.ot").exists(), "checkpoint at step 10");
     }
 }
