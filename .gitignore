@@ -1,1 +1,4 @@
 /target
+/libtorch-*.zip
+/runs
+/checkpoints
