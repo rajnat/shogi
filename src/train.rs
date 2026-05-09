@@ -111,6 +111,27 @@ impl Trainer {
         self.config.min_buffer_size
     }
 
+    /// Policy loss: cross-entropy between `policy_logits` and `policy_targets`.
+    ///
+    /// `policy_targets` is the MCTS visit distribution — a proper probability
+    /// distribution (sums to 1) over all actions.  Because the target is soft
+    /// (not a one-hot class index) we compute the loss manually:
+    ///
+    /// ```text
+    /// L_policy = -mean( Σ_a  π(a) · log softmax(logits)(a) )
+    /// ```
+    ///
+    /// `policy_logits`: `[B, NUM_ACTIONS]` — raw network output, no softmax.
+    /// `policy_targets`: `[B, NUM_ACTIONS]` — MCTS visit distribution.
+    ///
+    /// Returns a scalar tensor.
+    pub fn policy_loss(&self, policy_logits: &Tensor, policy_targets: &Tensor) -> Tensor {
+        let log_probs = policy_logits.log_softmax(-1, tch::Kind::Float);
+        -(log_probs * policy_targets)
+            .sum_dim_intlist([-1].as_slice(), false, tch::Kind::Float)
+            .mean(tch::Kind::Float)
+    }
+
     /// Returns the configured batch size.
     pub fn batch_size(&self) -> usize {
         self.config.batch_size
@@ -264,5 +285,114 @@ mod tests {
         let (policy, _) = t.forward(&boards);
         assert_eq!(policy.isnan().any().int64_value(&[]), 0, "policy has NaN");
         assert_eq!(policy.isinf().any().int64_value(&[]), 0, "policy has Inf");
+    }
+
+    // ----- policy_loss -----
+
+    /// Uniform target distribution over all actions.
+    fn uniform_policy(batch: i64) -> Tensor {
+        let p = 1.0 / NUM_ACTIONS as f64;
+        Tensor::full(
+            [batch, NUM_ACTIONS as i64],
+            p,
+            (tch::Kind::Float, Device::Cpu),
+        )
+    }
+
+    #[test]
+    fn test_policy_loss_is_scalar() {
+        let t = trainer();
+        let (boards, policy_targets, _) = sample(&t);
+        let (logits, _) = t.forward(&boards);
+        let loss = t.policy_loss(&logits, &policy_targets);
+        assert_eq!(
+            loss.size(),
+            Vec::<i64>::new(),
+            "policy loss should be a scalar"
+        );
+    }
+
+    #[test]
+    fn test_policy_loss_non_negative() {
+        let t = trainer();
+        let (boards, policy_targets, _) = sample(&t);
+        let (logits, _) = t.forward(&boards);
+        let loss = t.policy_loss(&logits, &policy_targets);
+        assert!(loss.double_value(&[]) >= 0.0, "cross-entropy must be ≥ 0");
+    }
+
+    #[test]
+    fn test_policy_loss_uniform_target_equals_log_num_actions() {
+        // H(uniform) = log(NUM_ACTIONS); the minimum achievable loss with
+        // a uniform target is exactly log(N) when the predicted probs are also uniform.
+        let t = trainer();
+        let b = t.batch_size() as i64;
+        let uniform_logits =
+            Tensor::zeros([b, NUM_ACTIONS as i64], (tch::Kind::Float, Device::Cpu));
+        let uniform_target = uniform_policy(b);
+        let loss = t.policy_loss(&uniform_logits, &uniform_target);
+        let expected = (NUM_ACTIONS as f64).ln();
+        let diff = (loss.double_value(&[]) - expected).abs();
+        assert!(
+            diff < 1e-4,
+            "H(uniform) mismatch: got {:.4}, expected {expected:.4}",
+            loss.double_value(&[])
+        );
+    }
+
+    #[test]
+    fn test_policy_loss_lower_when_logits_match_target() {
+        // Loss should be strictly lower when the logits favour the target action
+        // compared to uniform logits.
+        let t = trainer();
+        let b = t.batch_size() as i64;
+        // One-hot target on action 0.
+        let mut target_data = vec![0.0f32; b as usize * NUM_ACTIONS];
+        for i in 0..b as usize {
+            target_data[i * NUM_ACTIONS] = 1.0;
+        }
+        let target = Tensor::from_slice(&target_data).reshape([b, NUM_ACTIONS as i64]);
+
+        // Logits that strongly favour action 0.
+        let mut logit_data = vec![0.0f32; b as usize * NUM_ACTIONS];
+        for i in 0..b as usize {
+            logit_data[i * NUM_ACTIONS] = 10.0;
+        }
+        let good_logits = Tensor::from_slice(&logit_data).reshape([b, NUM_ACTIONS as i64]);
+
+        let uniform_logits =
+            Tensor::zeros([b, NUM_ACTIONS as i64], (tch::Kind::Float, Device::Cpu));
+
+        let loss_good = t.policy_loss(&good_logits, &target).double_value(&[]);
+        let loss_uniform = t.policy_loss(&uniform_logits, &target).double_value(&[]);
+        assert!(
+            loss_good < loss_uniform,
+            "matched logits ({loss_good:.4}) should have lower loss than uniform ({loss_uniform:.4})"
+        );
+    }
+
+    #[test]
+    fn test_policy_loss_near_zero_for_perfect_prediction() {
+        // When logits perfectly match a one-hot target, loss ≈ 0.
+        let t = trainer();
+        let b = t.batch_size() as i64;
+        let mut target_data = vec![0.0f32; b as usize * NUM_ACTIONS];
+        for i in 0..b as usize {
+            target_data[i * NUM_ACTIONS] = 1.0;
+        }
+        let target = Tensor::from_slice(&target_data).reshape([b, NUM_ACTIONS as i64]);
+
+        // Very large logit on the target action → softmax ≈ 1 there, ≈ 0 elsewhere.
+        let mut logit_data = vec![0.0f32; b as usize * NUM_ACTIONS];
+        for i in 0..b as usize {
+            logit_data[i * NUM_ACTIONS] = 100.0;
+        }
+        let logits = Tensor::from_slice(&logit_data).reshape([b, NUM_ACTIONS as i64]);
+
+        let loss = t.policy_loss(&logits, &target).double_value(&[]);
+        assert!(
+            loss < 1e-3,
+            "loss should be near 0 for perfect prediction, got {loss:.6}"
+        );
     }
 }
