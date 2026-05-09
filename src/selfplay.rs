@@ -679,6 +679,105 @@ mod tests {
         );
     }
 
+    // ----- resign logic tests -----
+    //
+    // resign_threshold = 2.0 makes the condition (v < threshold) always true,
+    // because the value head uses tanh whose output is in (−1, 1).
+    // This lets us precisely control when resign fires without needing a mock net.
+
+    fn always_resign_config(min_ply: u32, consecutive: u32) -> SelfPlayConfig {
+        SelfPlayConfig {
+            num_simulations:   4,
+            resign_threshold:  2.0, // always satisfied
+            resign_min_ply:    min_ply,
+            resign_consecutive: consecutive,
+            max_moves:         50,
+            ..SelfPlayConfig::default()
+        }
+    }
+
+    // Plies and their colors from startpos (Black always moves first):
+    //   ply 0 → Black,  ply 1 → White,  ply 2 → Black,  ply 3 → White, …
+    // Colors alternate so ply N is Black when N is even, White when N is odd.
+
+    /// Resign fires on ply 0 (Black to move): one record, outcome = −1.
+    #[test]
+    fn test_resign_fires_on_first_consecutive_ply() {
+        let (_vs, net) = build_with_config(Device::Cpu, 8, 2);
+        let mut rng = rand::thread_rng();
+        let result = play_game(&net, &always_resign_config(0, 1), Device::Cpu, &mut rng);
+
+        // resign_consecutive = 1 → resign on the very first ply that satisfies the threshold.
+        assert_eq!(result.records.len(), 1, "exactly one record before resign");
+        assert_eq!(result.outcome, -1.0, "Black (ply 0) resigned → outcome = −1");
+    }
+
+    /// Resign requires N consecutive plies below the threshold.
+    /// With consecutive=3 and threshold always satisfied, resign fires on ply 2 (Black).
+    #[test]
+    fn test_resign_fires_after_exactly_n_consecutive_plies() {
+        let (_vs, net) = build_with_config(Device::Cpu, 8, 2);
+        let mut rng = rand::thread_rng();
+        let result = play_game(&net, &always_resign_config(0, 3), Device::Cpu, &mut rng);
+
+        // Plies 0,1,2 all satisfy threshold → resign on ply 2 (Black to move).
+        assert_eq!(result.records.len(), 3, "three records for plies 0–2");
+        assert_eq!(result.outcome, -1.0, "Black (ply 2) resigned → outcome = −1");
+    }
+
+    /// resign_min_ply prevents early resignation.
+    /// With min_ply=5 and consecutive=1, resign fires on ply 5 (White to move).
+    #[test]
+    fn test_resign_not_before_min_ply() {
+        let (_vs, net) = build_with_config(Device::Cpu, 8, 2);
+        let mut rng = rand::thread_rng();
+        let result = play_game(&net, &always_resign_config(5, 1), Device::Cpu, &mut rng);
+
+        // Plies 0–4 are guarded by resign_min_ply=5 (counter stays 0).
+        // Ply 5 (White, first eligible ply): counter=1 ≥ 1 → resign.
+        assert_eq!(result.records.len(), 6, "six records for plies 0–5");
+        assert_eq!(result.outcome, 1.0, "White (ply 5) resigned → outcome = +1 for Black");
+    }
+
+    /// Resign never fires when the threshold is impossible to satisfy.
+    /// tanh output ∈ (−1, 1), so threshold = −2.0 is never met; game ends by draw.
+    #[test]
+    fn test_resign_never_fires_when_threshold_not_met() {
+        let (_vs, net) = build_with_config(Device::Cpu, 8, 2);
+        let config = SelfPlayConfig {
+            num_simulations:   4,
+            resign_threshold:  -2.0, // never satisfied
+            resign_min_ply:    0,
+            resign_consecutive: 1,
+            max_moves:         4,
+            ..SelfPlayConfig::default()
+        };
+        let mut rng = rand::thread_rng();
+        let result = play_game(&net, &config, Device::Cpu, &mut rng);
+
+        assert_eq!(result.outcome, 0.0, "threshold never met → draw by move limit");
+    }
+
+    /// If the counter has not yet reached consecutive, resign must not fire.
+    /// consecutive=3, max_moves=2 → counter reaches 2 but the loop ends first.
+    #[test]
+    fn test_resign_requires_full_consecutive_count() {
+        let (_vs, net) = build_with_config(Device::Cpu, 8, 2);
+        let config = SelfPlayConfig {
+            num_simulations:   4,
+            resign_threshold:  2.0,
+            resign_min_ply:    0,
+            resign_consecutive: 3,
+            max_moves:         2, // loop ends after 2 plies, counter reaches 2 < 3
+            ..SelfPlayConfig::default()
+        };
+        let mut rng = rand::thread_rng();
+        let result = play_game(&net, &config, Device::Cpu, &mut rng);
+
+        // Counter: ply 0 → 1, ply 1 → 2; loop exits; no resign.
+        assert_eq!(result.outcome, 0.0, "consecutive count not reached → draw");
+    }
+
     /// Each move changes the board — consecutive records should have different tensors.
     #[test]
     fn test_sequential_records_have_distinct_boards() {
