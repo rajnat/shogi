@@ -172,6 +172,36 @@ impl Trainer {
         (total, lp, lv)
     }
 
+    /// Run one complete training step: sample → forward → loss → backward → optimizer.
+    ///
+    /// `opt.backward_step` zeros gradients, runs backprop, then applies the Adam
+    /// update in a single call — the idiomatic tch-rs pattern.
+    ///
+    /// Returns `(total, policy, value)` loss values as `f64` scalars so the
+    /// caller can log them without holding a live tensor.  `self.step` is
+    /// incremented after each call.
+    pub fn train_step<R: Rng>(
+        &mut self,
+        buffer: &Arc<Mutex<ReplayBuffer>>,
+        rng: &mut R,
+    ) -> (f64, f64, f64) {
+        let (boards, policy_targets, value_targets) = self.sample_batch(buffer, rng);
+        let (policy_logits, pred_values) = self.forward(&boards);
+        let (total, lp, lv) = self.total_loss(
+            &policy_logits,
+            &policy_targets,
+            &pred_values,
+            &value_targets,
+        );
+        self.opt.backward_step(&total);
+        self.step += 1;
+        (
+            total.double_value(&[]),
+            lp.double_value(&[]),
+            lv.double_value(&[]),
+        )
+    }
+
     /// Returns the configured batch size.
     pub fn batch_size(&self) -> usize {
         self.config.batch_size
@@ -586,6 +616,68 @@ mod tests {
         assert!(
             diff < 1e-6,
             "when value loss = 0, total should equal policy loss"
+        );
+    }
+
+    // ----- train_step -----
+
+    fn trainer_mut() -> Trainer {
+        Trainer::new(Device::Cpu, 8, 2, small_config())
+    }
+
+    #[test]
+    fn test_train_step_returns_finite_losses() {
+        let mut t = trainer_mut();
+        let buf = filled_buffer(t.min_buffer_size());
+        let mut rng = StdRng::seed_from_u64(0);
+        let (total, lp, lv) = t.train_step(&buf, &mut rng);
+        assert!(total.is_finite(), "total loss is not finite: {total}");
+        assert!(lp.is_finite(), "policy loss is not finite: {lp}");
+        assert!(lv.is_finite(), "value loss is not finite: {lv}");
+    }
+
+    #[test]
+    fn test_train_step_increments_counter() {
+        let mut t = trainer_mut();
+        let buf = filled_buffer(t.min_buffer_size());
+        let mut rng = StdRng::seed_from_u64(0);
+        assert_eq!(t.step, 0);
+        t.train_step(&buf, &mut rng);
+        assert_eq!(t.step, 1);
+        t.train_step(&buf, &mut rng);
+        assert_eq!(t.step, 2);
+    }
+
+    #[test]
+    fn test_train_step_losses_non_negative() {
+        let mut t = trainer_mut();
+        let buf = filled_buffer(t.min_buffer_size());
+        let mut rng = StdRng::seed_from_u64(0);
+        let (total, lp, lv) = t.train_step(&buf, &mut rng);
+        assert!(total >= 0.0, "total loss < 0: {total}");
+        assert!(lp >= 0.0, "policy loss < 0: {lp}");
+        assert!(lv >= 0.0, "value loss < 0: {lv}");
+    }
+
+    #[test]
+    fn test_train_step_loss_decreases_over_iterations() {
+        // Run many steps on a fixed buffer and verify the network is learning
+        // (total loss at the end is strictly lower than at the start).
+        let mut t = trainer_mut();
+        // Use a slightly larger buffer so there is signal to overfit on.
+        let buf = filled_buffer(32);
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let (first_loss, _, _) = t.train_step(&buf, &mut rng);
+        for _ in 1..50 {
+            t.train_step(&buf, &mut rng);
+        }
+        let (last_loss, _, _) = t.train_step(&buf, &mut rng);
+
+        assert!(
+            last_loss < first_loss,
+            "loss did not decrease after 51 steps ({first_loss:.4} → {last_loss:.4}): \
+             gradients may not be flowing"
         );
     }
 }
