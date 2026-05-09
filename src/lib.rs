@@ -12,3 +12,4 @@ pub mod search;
 pub mod usi;
 pub mod mcts;
 pub mod nn;
+pub mod bench;
