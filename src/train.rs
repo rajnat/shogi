@@ -177,6 +177,8 @@ impl Trainer {
     /// `opt.backward_step` zeros gradients, runs backprop, then applies the Adam
     /// update in a single call — the idiomatic tch-rs pattern.
     ///
+    /// Prints a loss line to stdout when `step % log_every == 0`.
+    ///
     /// Returns `(total, policy, value)` loss values as `f64` scalars so the
     /// caller can log them without holding a live tensor.  `self.step` is
     /// incremented after each call.
@@ -195,11 +197,36 @@ impl Trainer {
         );
         self.opt.backward_step(&total);
         self.step += 1;
-        (
+        let losses = (
             total.double_value(&[]),
             lp.double_value(&[]),
             lv.double_value(&[]),
-        )
+        );
+        if self.step % self.config.log_every == 0 {
+            println!(
+                "{}",
+                Self::format_log_line(self.step, losses.0, losses.1, losses.2)
+            );
+        }
+        losses
+    }
+
+    /// Format a single log line for a training step.
+    ///
+    /// Extracted so the format can be tested without running a full training step
+    /// or capturing stdout.
+    pub fn format_log_line(step: u64, total: f64, policy: f64, value: f64) -> String {
+        format!("step {step:6}  total={total:.4}  policy={policy:.4}  value={value:.4}")
+    }
+
+    /// Returns `true` if losses should be logged after `step`.
+    pub fn should_log(&self, step: u64) -> bool {
+        step % self.config.log_every == 0
+    }
+
+    /// Returns the configured logging interval.
+    pub fn log_every(&self) -> u64 {
+        self.config.log_every
     }
 
     /// Returns the configured batch size.
@@ -679,5 +706,81 @@ mod tests {
             "loss did not decrease after 51 steps ({first_loss:.4} → {last_loss:.4}): \
              gradients may not be flowing"
         );
+    }
+
+    // ----- log -----
+
+    #[test]
+    fn test_log_every_accessor() {
+        let t = trainer();
+        assert_eq!(t.log_every(), small_config().log_every);
+    }
+
+    #[test]
+    fn test_should_log_fires_at_multiples() {
+        let t = trainer(); // log_every = small_config().log_every (default 100)
+        let every = t.log_every();
+        assert!(t.should_log(every), "should log at step {every}");
+        assert!(t.should_log(2 * every), "should log at step {}", 2 * every);
+        assert!(
+            !t.should_log(every - 1),
+            "should not log at step {}",
+            every - 1
+        );
+        assert!(
+            !t.should_log(every + 1),
+            "should not log at step {}",
+            every + 1
+        );
+    }
+
+    #[test]
+    fn test_should_log_at_zero() {
+        let t = trainer();
+        // Step 0 satisfies 0 % N == 0 — fires on initialisation before any step.
+        assert!(t.should_log(0));
+    }
+
+    #[test]
+    fn test_format_log_line_contains_all_fields() {
+        let line = Trainer::format_log_line(100, 8.1234, 7.0001, 1.1233);
+        assert!(line.contains("100"), "missing step:   {line}");
+        assert!(line.contains("8.1234"), "missing total:  {line}");
+        assert!(line.contains("7.0001"), "missing policy: {line}");
+        assert!(line.contains("1.1233"), "missing value:  {line}");
+    }
+
+    #[test]
+    fn test_format_log_line_field_labels() {
+        let line = Trainer::format_log_line(200, 1.0, 0.5, 0.5);
+        assert!(line.contains("step"), "missing 'step' label");
+        assert!(line.contains("total"), "missing 'total' label");
+        assert!(line.contains("policy"), "missing 'policy' label");
+        assert!(line.contains("value"), "missing 'value' label");
+    }
+
+    #[test]
+    fn test_train_step_logs_at_configured_interval() {
+        // Use log_every=3 so the test runs fast.  Run exactly 3 steps and verify
+        // the step counter reaches 3 (logging would have fired on step 3).
+        // We don't capture stdout — testing the side-effect format is enough.
+        let mut t = Trainer::new(
+            Device::Cpu,
+            8,
+            2,
+            TrainConfig {
+                batch_size: 4,
+                min_buffer_size: 4,
+                log_every: 3,
+                ..TrainConfig::default()
+            },
+        );
+        let buf = filled_buffer(4);
+        let mut rng = StdRng::seed_from_u64(0);
+        for _ in 0..3 {
+            t.train_step(&buf, &mut rng);
+        }
+        assert_eq!(t.step, 3);
+        assert!(t.should_log(t.step), "step {} should trigger a log", t.step);
     }
 }
