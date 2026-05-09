@@ -59,6 +59,16 @@ pub fn checkpoint_path(dir: &str, step: u64) -> PathBuf {
     Path::new(dir).join(format!("step_{step:08}.ot"))
 }
 
+/// Parse the training step encoded in a checkpoint filename produced by `checkpoint_path`.
+///
+/// Expects filenames of the form `step_XXXXXXXX.ot` (8 zero-padded digits).
+/// Returns `None` for any other filename format.
+pub fn parse_step_from_filename(path: &Path) -> Option<u64> {
+    let stem = path.file_stem()?.to_str()?;
+    let digits = stem.strip_prefix("step_")?;
+    digits.parse().ok()
+}
+
 /// Save a checkpoint if `step` just crossed a `checkpoint_every` boundary.
 ///
 /// Returns the path of the written checkpoint, or `None` if no checkpoint was due.
@@ -468,6 +478,33 @@ mod tests {
     fn test_checkpoint_path_zero_padded() {
         let p = checkpoint_path("out/ckpt", 42);
         assert_eq!(p, PathBuf::from("out/ckpt/step_00000042.ot"));
+    }
+
+    // ----- parse_step_from_filename -----
+
+    #[test]
+    fn test_parse_step_roundtrip() {
+        let path = checkpoint_path("checkpoints", 5000);
+        assert_eq!(parse_step_from_filename(&path), Some(5000));
+    }
+
+    #[test]
+    fn test_parse_step_leading_zeros() {
+        let path = PathBuf::from("dir/step_00000042.ot");
+        assert_eq!(parse_step_from_filename(&path), Some(42));
+    }
+
+    #[test]
+    fn test_parse_step_unrecognised_filename() {
+        let path = PathBuf::from("dir/model_final.ot");
+        assert_eq!(parse_step_from_filename(&path), None);
+    }
+
+    #[test]
+    fn test_parse_step_no_extension() {
+        let path = PathBuf::from("step_00001000");
+        // file_stem strips nothing useful here — digits are still parseable
+        assert_eq!(parse_step_from_filename(&path), Some(1000));
     }
 
     // ----- maybe_checkpoint -----

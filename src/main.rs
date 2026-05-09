@@ -1,3 +1,7 @@
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use clap::{Parser, Subcommand};
 use shogi_core::board::Board;
 use shogi_core::perft::{perft, perft_divide};
@@ -24,6 +28,33 @@ enum Commands {
     },
     /// Print the startpos SFEN string
     Startpos,
+    /// Run the AlphaZero self-play training loop
+    Train {
+        /// Network channel width (8 = quick smoke-test; 256 = full AlphaZero)
+        #[arg(long, default_value_t = 256)]
+        channels: i64,
+        /// Number of residual blocks (2 = quick; 20 = full AlphaZero)
+        #[arg(long, default_value_t = 20)]
+        blocks: usize,
+        /// Number of parallel self-play worker threads
+        #[arg(long, default_value_t = 4)]
+        workers: usize,
+        /// Directory to write checkpoint files into
+        #[arg(long, default_value = "checkpoints")]
+        checkpoint_dir: String,
+        /// Save a checkpoint every N training steps (0 = never)
+        #[arg(long, default_value_t = 1000)]
+        checkpoint_every: u64,
+        /// Stop after N total training steps (0 = run until Ctrl-C)
+        #[arg(long, default_value_t = 0)]
+        total_steps: u64,
+        /// Number of pit games to play after each checkpoint (0 = skip)
+        #[arg(long, default_value_t = 100)]
+        pit_games: u64,
+        /// Resume training from this checkpoint file
+        #[arg(long)]
+        resume: Option<PathBuf>,
+    },
     /// Benchmark neural-net MCTS vs rollout-MCTS baseline
     ///
     /// Plays a match between two MCTS agents: one using network policy+value,
@@ -79,6 +110,76 @@ fn main() {
 
         Commands::Startpos => {
             println!("{}", Board::startpos().to_sfen());
+        }
+
+        Commands::Train {
+            channels,
+            blocks,
+            workers,
+            checkpoint_dir,
+            checkpoint_every,
+            total_steps,
+            pit_games,
+            resume,
+        } => {
+            use std::sync::Mutex;
+            use rand::SeedableRng;
+            use rand::rngs::StdRng;
+            use shogi_core::nn;
+            use shogi_core::orchestrate::{OrchestrationConfig, run_loop};
+            use shogi_core::replay_buffer::ReplayBuffer;
+            use shogi_core::selfplay::SelfPlayConfig;
+            use shogi_core::train::{TrainConfig, Trainer};
+            use shogi_core::worker::WorkerPool;
+
+            let device = nn::device();
+
+            let mut trainer = Trainer::new(device, channels, blocks, TrainConfig::default());
+
+            if let Some(ref path) = resume {
+                trainer.resume(path);
+            }
+
+            let buffer = Arc::new(Mutex::new(ReplayBuffer::new(1_000_000)));
+
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let sd = Arc::clone(&shutdown);
+            ctrlc::set_handler(move || {
+                println!("\nShutdown signal received — finishing current game…");
+                sd.store(true, Ordering::Relaxed);
+            })
+            .expect("failed to set Ctrl-C handler");
+
+            let pool = if workers > 0 {
+                Some(WorkerPool::spawn(
+                    workers,
+                    &trainer.vs,
+                    channels,
+                    blocks,
+                    SelfPlayConfig::default(),
+                    Arc::clone(&buffer),
+                    42,
+                ))
+            } else {
+                None
+            };
+
+            let config = OrchestrationConfig {
+                steps_per_broadcast: 100,
+                total_steps,
+                fill_poll_ms: 200,
+                checkpoint_every,
+                checkpoint_dir,
+                pit_games,
+            };
+
+            let mut rng = StdRng::seed_from_u64(0);
+            run_loop(&mut trainer, buffer, pool.as_ref(), &config, &mut rng, shutdown);
+
+            if let Some(p) = pool {
+                p.join();
+            }
+            println!("Training complete at step {}.", trainer.step);
         }
 
         Commands::Bench {

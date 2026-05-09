@@ -76,6 +76,21 @@ impl Trainer {
         }
     }
 
+    /// Resume training from a saved checkpoint.
+    ///
+    /// Loads weights from `path` into the VarStore and, if the filename follows the
+    /// `step_XXXXXXXX.ot` convention produced by `checkpoint_path`, restores
+    /// `self.step` so logging and checkpoint intervals remain correct.
+    pub fn resume(&mut self, path: &std::path::Path) {
+        self.vs.load(path).unwrap_or_else(|e| panic!("failed to load checkpoint {path:?}: {e}"));
+        if let Some(step) = crate::orchestrate::parse_step_from_filename(path) {
+            self.step = step;
+            println!("Resumed from {path:?} at step {step}.");
+        } else {
+            println!("Loaded weights from {path:?} (step counter not restored).");
+        }
+    }
+
     /// Draw one mini-batch from `buffer` and move it to the training device.
     ///
     /// Returns `(boards, policies, values)`:
@@ -786,5 +801,55 @@ mod tests {
         }
         assert_eq!(t.step, 3);
         assert!(t.should_log(t.step), "step {} should trigger a log", t.step);
+    }
+
+    // ----- resume -----
+
+    #[test]
+    fn test_resume_restores_step_from_filename() {
+        use crate::orchestrate::checkpoint_path;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = checkpoint_path(dir.path().to_str().unwrap(), 7500);
+
+        // Save a checkpoint at step 7500.
+        let t_save = Trainer::new(Device::Cpu, 8, 2, small_config());
+        t_save.vs.save(&path).unwrap();
+
+        // Load into a fresh trainer — step should jump to 7500.
+        let mut t_load = Trainer::new(Device::Cpu, 8, 2, small_config());
+        assert_eq!(t_load.step, 0);
+        t_load.resume(&path);
+        assert_eq!(t_load.step, 7500, "step should be restored from filename");
+    }
+
+    #[test]
+    fn test_resume_loads_weights() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("weights.ot");
+
+        // Train a few steps so weights differ from init.
+        let buf = filled_buffer(4);
+        let mut rng = StdRng::seed_from_u64(0);
+        let mut t_trained = Trainer::new(Device::Cpu, 8, 2, small_config());
+        for _ in 0..5 {
+            t_trained.train_step(&buf, &mut rng);
+        }
+        t_trained.vs.save(&path).unwrap();
+
+        // Load into a fresh trainer and verify weights match.
+        let mut t_loaded = Trainer::new(Device::Cpu, 8, 2, small_config());
+        t_loaded.resume(&path);
+
+        let vars_trained = t_trained.vs.variables();
+        let vars_loaded = t_loaded.vs.variables();
+        for (name, tensor) in &vars_trained {
+            let loaded = vars_loaded.get(name).expect("variable missing after resume");
+            let max_diff = (tensor - loaded).abs().max().double_value(&[]);
+            assert!(
+                max_diff < 1e-6,
+                "variable {name} differs after resume (max diff {max_diff})"
+            );
+        }
     }
 }
