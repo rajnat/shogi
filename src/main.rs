@@ -1,6 +1,6 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use shogi_core::board::Board;
@@ -48,6 +48,21 @@ enum Commands {
         /// Stop after N total training steps (0 = run until Ctrl-C)
         #[arg(long, default_value_t = 0)]
         total_steps: u64,
+        /// Mini-batch size sampled from the replay buffer each training step
+        #[arg(long, default_value_t = 512)]
+        batch_size: usize,
+        /// Adam optimizer learning rate
+        #[arg(long, default_value_t = 1e-3)]
+        learning_rate: f64,
+        /// Adam optimizer weight decay
+        #[arg(long, default_value_t = 1e-4)]
+        weight_decay: f64,
+        /// Minimum replay-buffer positions required before training starts
+        #[arg(long, default_value_t = 10_000)]
+        min_buffer_size: usize,
+        /// Log training losses every N steps
+        #[arg(long, default_value_t = 100)]
+        log_every: u64,
         /// Number of pit games to play after each checkpoint (0 = skip)
         #[arg(long, default_value_t = 100)]
         pit_games: u64,
@@ -91,6 +106,49 @@ enum Commands {
     },
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn train_cli_parses_training_hyperparameters() {
+        let cli = Cli::try_parse_from([
+            "shogi",
+            "train",
+            "--batch-size",
+            "128",
+            "--learning-rate",
+            "0.0003",
+            "--weight-decay",
+            "0.00001",
+            "--min-buffer-size",
+            "2048",
+            "--log-every",
+            "25",
+        ])
+        .expect("train CLI should parse training hyperparameters");
+
+        let Some(Commands::Train {
+            batch_size,
+            learning_rate,
+            weight_decay,
+            min_buffer_size,
+            log_every,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected train command");
+        };
+
+        assert_eq!(batch_size, 128);
+        assert!((learning_rate - 0.0003).abs() < f64::EPSILON);
+        assert!((weight_decay - 0.00001).abs() < f64::EPSILON);
+        assert_eq!(min_buffer_size, 2048);
+        assert_eq!(log_every, 25);
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     match cli.command.unwrap_or(Commands::Usi) {
@@ -119,22 +177,34 @@ fn main() {
             checkpoint_dir,
             checkpoint_every,
             total_steps,
+            batch_size,
+            learning_rate,
+            weight_decay,
+            min_buffer_size,
+            log_every,
             pit_games,
             resume,
         } => {
-            use std::sync::Mutex;
-            use rand::SeedableRng;
             use rand::rngs::StdRng;
+            use rand::SeedableRng;
             use shogi_core::nn;
-            use shogi_core::orchestrate::{OrchestrationConfig, run_loop};
+            use shogi_core::orchestrate::{run_loop, OrchestrationConfig};
             use shogi_core::replay_buffer::ReplayBuffer;
             use shogi_core::selfplay::SelfPlayConfig;
             use shogi_core::train::{TrainConfig, Trainer};
             use shogi_core::worker::WorkerPool;
+            use std::sync::Mutex;
 
             let device = nn::device();
 
-            let mut trainer = Trainer::new(device, channels, blocks, TrainConfig::default());
+            let train_config = TrainConfig {
+                batch_size,
+                learning_rate,
+                weight_decay,
+                min_buffer_size,
+                log_every,
+            };
+            let mut trainer = Trainer::new(device, channels, blocks, train_config);
 
             if let Some(ref path) = resume {
                 trainer.resume(path);
@@ -174,7 +244,14 @@ fn main() {
             };
 
             let mut rng = StdRng::seed_from_u64(0);
-            run_loop(&mut trainer, buffer, pool.as_ref(), &config, &mut rng, shutdown);
+            run_loop(
+                &mut trainer,
+                buffer,
+                pool.as_ref(),
+                &config,
+                &mut rng,
+                shutdown,
+            );
 
             if let Some(p) = pool {
                 p.join();
@@ -192,7 +269,7 @@ fn main() {
             verbose,
             seed,
         } => {
-            use shogi_core::bench::{AgentKind, run_match};
+            use shogi_core::bench::{run_match, AgentKind};
             use shogi_core::nn::{self, checkpoint as ckpt};
 
             let device = nn::device();
@@ -221,10 +298,15 @@ fn main() {
             // Run without gradient tracking for inference speed.
             let result = tch::no_grad(|| {
                 run_match(
-                    &net_agent, "Net",
-                    &rollout_agent, "Rollout",
-                    games, sims, max_moves,
-                    verbose, seed,
+                    &net_agent,
+                    "Net",
+                    &rollout_agent,
+                    "Rollout",
+                    games,
+                    sims,
+                    max_moves,
+                    verbose,
+                    seed,
                 )
             });
 
