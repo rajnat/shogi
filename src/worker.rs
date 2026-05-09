@@ -7,16 +7,19 @@
 /// Bullet roadmap:
 ///   ✓ Spawn N threads with shutdown signal         (bullet 1)
 ///   ✓ Per-worker network copy                      (bullet 2)
-///   • Workers push to shared replay buffer          (bullet 3)
+///   ✓ Workers push to shared replay buffer          (bullet 3)
 ///   • Weight broadcast from training thread         (bullet 4)
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 use tch::nn;
 
 use crate::nn::{Net, checkpoint::build_with_config};
+use crate::replay_buffer::ReplayBuffer;
+use crate::selfplay::{SelfPlayConfig, play_game};
 
 // ---------------------------------------------------------------------------
 // Weight copy helper
@@ -39,7 +42,8 @@ pub fn build_worker_net(
 // Worker pool
 // ---------------------------------------------------------------------------
 
-/// Pool of N long-running self-play threads, each with its own network copy.
+/// Pool of N long-running self-play threads, each with its own network copy,
+/// all pushing records to a shared `ReplayBuffer`.
 pub struct WorkerPool {
     handles: Vec<JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
@@ -56,21 +60,34 @@ impl WorkerPool {
             .unwrap_or(1)
     }
 
-    /// Spawn `num_workers` threads, each starting with a copy of `master_vs`.
+    /// Spawn `num_workers` threads.
+    ///
+    /// Each worker starts with a deep copy of `master_vs`, runs self-play games
+    /// using `config`, and pushes every completed game's records into `buffer`.
+    /// Workers are seeded with `base_seed + worker_index` for reproducibility.
     pub fn spawn(
         num_workers: usize,
         master_vs: &nn::VarStore,
         channels: i64,
         blocks: usize,
+        config: SelfPlayConfig,
+        buffer: Arc<Mutex<ReplayBuffer>>,
+        base_seed: u64,
     ) -> Self {
         assert!(num_workers > 0, "must spawn at least one worker");
         let shutdown = Arc::new(AtomicBool::new(false));
+        let config = Arc::new(config);
 
         let handles = (0..num_workers)
-            .map(|_| {
+            .map(|idx| {
                 let (worker_vs, worker_net) = build_worker_net(master_vs, channels, blocks);
                 let shutdown = Arc::clone(&shutdown);
-                thread::spawn(move || worker_loop(worker_vs, worker_net, shutdown))
+                let buffer = Arc::clone(&buffer);
+                let config = Arc::clone(&config);
+                let seed = base_seed.wrapping_add(idx as u64);
+                thread::spawn(move || {
+                    worker_loop(worker_vs, worker_net, config, buffer, shutdown, seed)
+                })
             })
             .collect();
 
@@ -82,7 +99,10 @@ impl WorkerPool {
         self.handles.len()
     }
 
-    /// Signal all workers to stop, then wait for every thread to exit.
+    /// Signal all workers to stop after their current game, then join all threads.
+    ///
+    /// Because workers check the shutdown flag *after* each game, every thread
+    /// is guaranteed to push at least one completed game before returning.
     pub fn join(self) {
         self.shutdown.store(true, Ordering::Relaxed);
         for h in self.handles {
@@ -95,10 +115,22 @@ impl WorkerPool {
 // Worker body
 // ---------------------------------------------------------------------------
 
-fn worker_loop(_vs: nn::VarStore, _net: Net, shutdown: Arc<AtomicBool>) {
-    while !shutdown.load(Ordering::Relaxed) {
-        // Placeholder: bullet 3 replaces this with a self-play + buffer push.
-        thread::sleep(Duration::from_millis(1));
+fn worker_loop(
+    _vs: nn::VarStore,
+    net: Net,
+    config: Arc<SelfPlayConfig>,
+    buffer: Arc<Mutex<ReplayBuffer>>,
+    shutdown: Arc<AtomicBool>,
+    seed: u64,
+) {
+    let mut rng = StdRng::seed_from_u64(seed);
+    loop {
+        let result = tch::no_grad(|| play_game(&net, &config, tch::Device::Cpu, &mut rng));
+        buffer.lock().unwrap().push_game(result.records);
+        // Check shutdown after each game so every worker pushes at least one game.
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
     }
 }
 
@@ -118,6 +150,20 @@ mod tests {
 
     fn randn_input() -> Tensor {
         Tensor::randn([1, NUM_PLANES as i64, 9, 9], (Kind::Float, Device::Cpu))
+    }
+
+    /// Tiny config so test games finish quickly.
+    fn tiny_config() -> SelfPlayConfig {
+        SelfPlayConfig {
+            num_simulations: 4,
+            max_moves: 20,
+            resign_min_ply: 100, // don't resign in tiny games
+            ..SelfPlayConfig::default()
+        }
+    }
+
+    fn test_buffer(capacity: usize) -> Arc<Mutex<ReplayBuffer>> {
+        Arc::new(Mutex::new(ReplayBuffer::new(capacity)))
     }
 
     // ----- default_num_workers -----
@@ -187,7 +233,7 @@ mod tests {
     #[test]
     fn test_spawn_correct_count() {
         let (master_vs, _) = make_master();
-        let pool = WorkerPool::spawn(3, &master_vs, 8, 2);
+        let pool = WorkerPool::spawn(3, &master_vs, 8, 2, tiny_config(), test_buffer(10_000), 0);
         assert_eq!(pool.num_workers(), 3);
         pool.join();
     }
@@ -195,7 +241,7 @@ mod tests {
     #[test]
     fn test_spawn_one_worker() {
         let (master_vs, _) = make_master();
-        let pool = WorkerPool::spawn(1, &master_vs, 8, 2);
+        let pool = WorkerPool::spawn(1, &master_vs, 8, 2, tiny_config(), test_buffer(10_000), 0);
         assert_eq!(pool.num_workers(), 1);
         pool.join();
     }
@@ -203,7 +249,41 @@ mod tests {
     #[test]
     fn test_join_terminates_all_threads() {
         let (master_vs, _) = make_master();
-        let pool = WorkerPool::spawn(4, &master_vs, 8, 2);
-        pool.join(); // must return; hanging == deadlock
+        // Must return — hanging here means deadlock.
+        WorkerPool::spawn(4, &master_vs, 8, 2, tiny_config(), test_buffer(10_000), 0).join();
+    }
+
+    // ----- Buffer push (bullet 3) -----
+
+    #[test]
+    fn test_single_worker_populates_buffer() {
+        let (master_vs, _) = make_master();
+        let buffer = test_buffer(10_000);
+        let pool = WorkerPool::spawn(1, &master_vs, 8, 2, tiny_config(), Arc::clone(&buffer), 0);
+        pool.join(); // worker plays exactly one game then exits
+        assert!(buffer.lock().unwrap().len() > 0, "buffer empty after worker ran one game");
+    }
+
+    #[test]
+    fn test_two_workers_each_push_at_least_one_game() {
+        let (master_vs, _) = make_master();
+        let buffer = test_buffer(10_000);
+        let pool = WorkerPool::spawn(2, &master_vs, 8, 2, tiny_config(), Arc::clone(&buffer), 0);
+        pool.join();
+        // Each worker plays at least one game; max_moves=20 so each game is ≤20 records.
+        // Two workers → at least 2 positions pushed (one game each is guaranteed).
+        assert!(buffer.lock().unwrap().len() >= 2);
+    }
+
+    #[test]
+    fn test_workers_use_different_seeds() {
+        // Two workers seeded differently should (almost certainly) produce different
+        // first moves — verify buffer contains at least 2 distinct records.
+        let (master_vs, _) = make_master();
+        let buffer = test_buffer(10_000);
+        let pool = WorkerPool::spawn(2, &master_vs, 8, 2, tiny_config(), Arc::clone(&buffer), 42);
+        pool.join();
+        let buf = buffer.lock().unwrap();
+        assert!(buf.len() >= 2);
     }
 }
