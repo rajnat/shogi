@@ -14,3 +14,4 @@ pub mod mcts;
 pub mod nn;
 pub mod bench;
 pub mod selfplay;
+pub mod replay_buffer;
