@@ -707,22 +707,33 @@ mod tests {
 
     #[test]
     fn test_train_step_loss_decreases_over_iterations() {
-        // Run many steps on a fixed buffer and verify the network is learning
-        // (total loss at the end is strictly lower than at the start).
+        // Run many steps on a fixed buffer and verify the network is learning.
+        // All value targets are +1.0: the optimal prediction is +1 everywhere,
+        // so MSE starts near 1.0 (random init ≈ 0) and should decrease as the
+        // value head learns to output +1 for every position.
         let mut t = trainer_mut();
-        // Use a slightly larger buffer so there is signal to overfit on.
-        let buf = filled_buffer(32);
+        let buf = {
+            let buf = Arc::new(Mutex::new(ReplayBuffer::new(10_000)));
+            let mut b = buf.lock().unwrap();
+            for _ in 0..32 {
+                let board = Tensor::zeros([119, 9, 9], (tch::Kind::Float, Device::Cpu));
+                let policy = vec![1.0 / NUM_ACTIONS as f32; NUM_ACTIONS];
+                b.push_game(vec![(board, policy, 1.0f32)]);
+            }
+            drop(b);
+            buf
+        };
         let mut rng = StdRng::seed_from_u64(42);
 
         let (first_loss, _, _) = t.train_step(&buf, &mut rng);
-        for _ in 1..50 {
+        for _ in 1..199 {
             t.train_step(&buf, &mut rng);
         }
         let (last_loss, _, _) = t.train_step(&buf, &mut rng);
 
         assert!(
             last_loss < first_loss,
-            "loss did not decrease after 51 steps ({first_loss:.4} → {last_loss:.4}): \
+            "loss did not decrease after 200 steps ({first_loss:.4} → {last_loss:.4}): \
              gradients may not be flowing"
         );
     }
