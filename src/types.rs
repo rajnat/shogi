@@ -186,6 +186,15 @@ pub fn rank_of(sq: Square) -> u8 {
     sq % 9
 }
 
+/// Reflect a square left-to-right (flip the file index, keep the rank).
+///
+/// `sq = file * 9 + rank`; mirrored file = 8 − file.
+/// This is an involution: `mirror_square(mirror_square(sq)) == sq`.
+#[inline]
+pub fn mirror_square(sq: Square) -> Square {
+    (8 - file_of(sq)) * 9 + rank_of(sq)
+}
+
 /// Returns the new square after taking a step (df, dr), or None if out of bounds
 #[inline]
 pub fn add_step(sq: Square, df: i8, dr: i8) -> Option<Square> {

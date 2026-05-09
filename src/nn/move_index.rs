@@ -24,8 +24,10 @@
 ///   The important invariant still holds: `move_to_index(index_to_move(i)) == i`.
 /// - `index_to_move_on_board` gives the correct piece type by looking it up
 ///   on the position; use it when the full `Move` is needed (e.g. make-move).
+use lazy_static::lazy_static;
+
 use crate::board::Board;
-use crate::types::{Move, PieceType};
+use crate::types::{Move, PieceType, mirror_square};
 
 /// Total distinct move indices — must equal `net::NUM_ACTIONS`.
 pub const NUM_ACTIONS: usize = 13_689;
@@ -96,6 +98,38 @@ pub fn index_to_move_on_board(idx: usize, board: &Board) -> Option<Move> {
         let pt      = PieceType::from_index(pt_idx)?;
         Some(Move::new_normal(from_sq, to_sq, pt, promote))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Left-right mirror
+// ---------------------------------------------------------------------------
+
+/// Map action index `idx` to the index of its horizontally-mirrored move.
+///
+/// - Board moves: both `from_sq` and `to_sq` are mirrored; `promote` is unchanged.
+/// - Drop moves:  `to_sq` is mirrored; piece type is unchanged.
+///
+/// This is an involution: `mirror_action(mirror_action(i)) == i`.
+pub fn mirror_action(idx: usize) -> usize {
+    if idx >= DROP_OFFSET {
+        let rel    = idx - DROP_OFFSET;
+        let pt_idx = rel / 81;
+        let to_sq  = (rel % 81) as u8;
+        DROP_OFFSET + pt_idx * 81 + mirror_square(to_sq) as usize
+    } else {
+        let from_sq = (idx / (81 * 2)) as u8;
+        let to_sq   = ((idx / 2) % 81) as u8;
+        let promote = idx % 2;
+        mirror_square(from_sq) as usize * 162
+            + mirror_square(to_sq) as usize * 2
+            + promote
+    }
+}
+
+lazy_static! {
+    /// Precomputed mirror permutation: `MIRROR_ACTION_TABLE[i]` = `mirror_action(i)`.
+    pub static ref MIRROR_ACTION_TABLE: Vec<usize> =
+        (0..NUM_ACTIONS).map(mirror_action).collect();
 }
 
 // ---------------------------------------------------------------------------
@@ -272,5 +306,71 @@ mod tests {
         }
         let board_max = move_to_index(Move::new_normal(80, 80, PieceType::Pawn, true));
         assert!(board_max < DROP_OFFSET);
+    }
+
+    // ----- mirror_action -----
+
+    #[test]
+    fn test_mirror_action_is_involution() {
+        for i in 0..NUM_ACTIONS {
+            assert_eq!(
+                mirror_action(mirror_action(i)), i,
+                "mirror_action is not an involution at index {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_mirror_action_is_permutation() {
+        let mut seen = vec![false; NUM_ACTIONS];
+        for i in 0..NUM_ACTIONS {
+            let j = mirror_action(i);
+            assert!(j < NUM_ACTIONS, "mirror_action({i}) = {j} out of range");
+            seen[j] = true;
+        }
+        assert!(seen.iter().all(|&b| b), "mirror_action is not surjective");
+    }
+
+    #[test]
+    fn test_mirror_action_table_matches_function() {
+        for i in 0..NUM_ACTIONS {
+            assert_eq!(
+                MIRROR_ACTION_TABLE[i], mirror_action(i),
+                "table mismatch at index {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_mirror_action_drop_moves() {
+        // Dropping a Pawn on file 9 (file_idx=0, sq=0+rank) should map to file 1 (file_idx=8).
+        let to_sq_original  = square(0, 4); // file 9, rank 5 → sq = 4
+        let to_sq_mirrored  = square(8, 4); // file 1, rank 5 → sq = 76
+        let idx_orig   = move_to_index(Move::new_drop(PieceType::Pawn, to_sq_original));
+        let idx_mirror = move_to_index(Move::new_drop(PieceType::Pawn, to_sq_mirrored));
+        assert_eq!(mirror_action(idx_orig), idx_mirror);
+        assert_eq!(mirror_action(idx_mirror), idx_orig);
+    }
+
+    #[test]
+    fn test_mirror_action_board_moves() {
+        // A move from sq(0,0) to sq(0,1) should mirror to sq(8,0) → sq(8,1).
+        let from_o = square(0, 0);
+        let to_o   = square(0, 1);
+        let from_m = square(8, 0);
+        let to_m   = square(8, 1);
+        for &promote in &[false, true] {
+            let idx_o = move_to_index(Move::new_normal(from_o, to_o, PieceType::Pawn, promote));
+            let idx_m = move_to_index(Move::new_normal(from_m, to_m, PieceType::Pawn, promote));
+            assert_eq!(mirror_action(idx_o), idx_m, "promote={promote}");
+        }
+    }
+
+    #[test]
+    fn test_mirror_action_center_square_is_fixed() {
+        // The center square sq(4,4) mirrors to itself; a drop there should map to itself.
+        let center = square(4, 4);
+        let idx = move_to_index(Move::new_drop(PieceType::Pawn, center));
+        assert_eq!(mirror_action(idx), idx, "center drop should be self-mirrored");
     }
 }
