@@ -532,6 +532,95 @@ mod tests {
         }
     }
 
+    // ----- backfill tests -----
+    //
+    // The backfill rule:
+    //   z(ply) = +outcome_for_black   when side_to_move == Black
+    //   z(ply) = -outcome_for_black   when side_to_move == White
+    //
+    // We control the exact resign ply to make these tests deterministic.
+
+    fn immediate_resign_config(consecutive: u32) -> SelfPlayConfig {
+        SelfPlayConfig {
+            num_simulations:   4,
+            resign_threshold:  2.0, // tanh output is always < 1 < 2, so always triggers
+            resign_min_ply:    0,
+            resign_consecutive: consecutive,
+            max_moves:         50,
+            ..SelfPlayConfig::default()
+        }
+    }
+
+    /// resign_consecutive=1 → resign fires on ply 0 (Black to move).
+    /// Black resigned → outcome = −1.0; the one record (Black's turn) gets z = −1.0.
+    #[test]
+    fn test_backfill_black_resigns_at_ply0() {
+        let (_vs, net) = build_with_config(Device::Cpu, 8, 2);
+        let mut rng = rand::thread_rng();
+        let result = play_game(&net, &immediate_resign_config(1), Device::Cpu, &mut rng);
+
+        assert_eq!(result.outcome, -1.0, "Black resigned → outcome must be −1");
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].2, -1.0, "Black-to-move record must carry z = −1");
+    }
+
+    /// resign_consecutive=2 → resign fires on ply 1 (White to move).
+    /// White resigned → outcome = +1.0 (Black wins).
+    /// Record 0 (Black to move): z = +1.0. Record 1 (White to move): z = −1.0.
+    #[test]
+    fn test_backfill_white_resigns_at_ply1() {
+        let (_vs, net) = build_with_config(Device::Cpu, 8, 2);
+        let mut rng = rand::thread_rng();
+        let result = play_game(&net, &immediate_resign_config(2), Device::Cpu, &mut rng);
+
+        assert_eq!(result.outcome, 1.0, "White resigned → outcome must be +1 for Black");
+        assert_eq!(result.records.len(), 2);
+        assert_eq!(result.records[0].2,  1.0, "Black-to-move record must carry z = +1");
+        assert_eq!(result.records[1].2, -1.0, "White-to-move record must carry z = −1");
+    }
+
+    /// In a decisive game, consecutive records always have opposite z values
+    /// because colors alternate every half-move.
+    #[test]
+    fn test_backfill_z_alternates_each_ply() {
+        let (_vs, net) = build_with_config(Device::Cpu, 8, 2);
+        // resign_consecutive=4 → 4 records before resign.
+        let mut rng = rand::thread_rng();
+        let result = play_game(&net, &immediate_resign_config(4), Device::Cpu, &mut rng);
+
+        // Only test alternation when the game was decisive.
+        if result.outcome == 0.0 {
+            return;
+        }
+        for w in result.records.windows(2) {
+            let z0 = w[0].2;
+            let z1 = w[1].2;
+            assert_eq!(
+                z0, -z1,
+                "consecutive z values must be opposite (got {z0} then {z1})"
+            );
+        }
+    }
+
+    /// Draw by move limit: every z must equal 0.0, matching outcome = 0.0.
+    #[test]
+    fn test_backfill_draw_gives_zero_for_every_ply() {
+        let (_vs, net) = build_with_config(Device::Cpu, 8, 2);
+        let config = SelfPlayConfig {
+            num_simulations: 4,
+            max_moves: 4,
+            resign_min_ply: 999, // no resign
+            ..SelfPlayConfig::default()
+        };
+        let mut rng = rand::thread_rng();
+        let result = play_game(&net, &config, Device::Cpu, &mut rng);
+
+        assert_eq!(result.outcome, 0.0, "move-limit game is a draw");
+        for (i, (_, _, z)) in result.records.iter().enumerate() {
+            assert_eq!(*z, 0.0, "ply {i}: draw must give z = 0, got {z}");
+        }
+    }
+
     /// outcome is always one of the three legal values.
     #[test]
     fn test_outcome_is_legal_value() {
