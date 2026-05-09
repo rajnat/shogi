@@ -219,7 +219,7 @@ pub const DEFAULT_ROLLOUT_DEPTH: usize = 200;
 ///    0.0  — draw (max depth reached without a terminal)
 ///
 /// The board passed in is never modified; rollout works on an internal clone.
-/// This function is the placeholder until the neural network (M5) takes over.
+/// This function is the placeholder until the neural network takes over.
 pub fn rollout<R: Rng>(board: &Board, rng: &mut R, max_depth: usize) -> f32 {
     let mut b = board.clone();
     let initial_side: Color = b.side_to_move;
@@ -575,7 +575,7 @@ pub fn mcts_search_with_net<R: Rng>(
 ///   [`BatchChannel::post_results`] to wake the waiting workers.
 /// - Workers unblock, read their score, and backprop.
 ///
-/// In M5 the `rollout` call inside the evaluator loop becomes a single neural-
+/// the `rollout` call inside the evaluator loop becomes a single neural-
 /// network forward pass on a stacked `[N, 119, 9, 9]` tensor.
 ///
 /// Returns `None` only if the root has no legal moves.

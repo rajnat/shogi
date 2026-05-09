@@ -5,7 +5,7 @@ use crate::board::Board;
 /// Instead of evaluating each MCTS leaf immediately (one rollout / one network
 /// call per leaf), workers deposit their leaves here.  Once the batch reaches
 /// `capacity`, the caller evaluates all non-terminal positions together — one
-/// GPU forward pass in M5, parallel rollouts now — and backprops all results.
+/// GPU forward pass, parallel rollouts now — and backprops all results.
 use std::sync::{Arc, Condvar, Mutex};
 
 // ---------------------------------------------------------------------------
@@ -166,7 +166,7 @@ impl ChannelState {
 /// 1. Call [`wait_for_batch`] — blocks until the batch is full (or the channel
 ///    is closed).  Returns `(boards, terminals)` for the batch, or `None` if
 ///    closed with no pending leaves.
-/// 2. Evaluate all boards (neural net forward pass in M5; parallel rollouts now).
+/// 2. Evaluate all boards (neural net forward pass; parallel rollouts now).
 /// 3. Call [`post_results`] with the scores — wakes all waiting workers.
 /// 4. Repeat until `wait_for_batch` returns `None`.
 ///

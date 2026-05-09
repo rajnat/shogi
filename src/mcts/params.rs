@@ -41,7 +41,7 @@ pub struct MctsConfig {
     /// Number of leaf positions accumulated before batch evaluation fires.
     ///
     /// Each search round collects exactly `batch_size` leaves, evaluates them
-    /// together (one GPU call in M5; parallel rollouts now), then backprops all
+    /// together parallel rollouts now, then backprops all
     /// results in a single lock acquisition.
     ///
     /// Set to 1 to evaluate each leaf immediately (equivalent to the pre-batch
@@ -66,7 +66,11 @@ impl Default for MctsConfig {
 
 impl MctsConfig {
     pub fn new(c_puct: f32, rollout_depth: usize) -> Self {
-        MctsConfig { c_puct, rollout_depth, ..MctsConfig::default() }
+        MctsConfig {
+            c_puct,
+            rollout_depth,
+            ..MctsConfig::default()
+        }
     }
 }
 

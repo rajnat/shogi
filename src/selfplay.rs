@@ -2,7 +2,7 @@
 ///
 /// `play_game` runs a complete game between a network and itself, collecting
 /// one `(board_tensor, policy_target, value_target)` record per position.
-/// These records feed directly into the training loop (M6-04).
+/// These records feed directly into the training loop.
 ///
 /// # Record layout
 ///
@@ -25,11 +25,11 @@ use rand::Rng;
 use tch::{Device, Tensor};
 
 use crate::board::Board;
-use crate::mcts::{Arena, MctsConfig, NodeIdx};
 use crate::mcts::search::{eval_with_net, mcts_search_with_evaluator};
+use crate::mcts::{Arena, MctsConfig, NodeIdx};
 use crate::movegen::generate_legal_moves;
 use crate::moves::make_move_full;
-use crate::nn::{Net, NUM_ACTIONS, encode, move_to_index};
+use crate::nn::{NUM_ACTIONS, Net, encode, move_to_index};
 use crate::types::Color;
 
 // ---------------------------------------------------------------------------
@@ -66,17 +66,17 @@ pub struct SelfPlayConfig {
 impl Default for SelfPlayConfig {
     fn default() -> Self {
         SelfPlayConfig {
-            num_simulations:    800,
-            temperature_high:   1.0,
+            num_simulations: 800,
+            temperature_high: 1.0,
             temperature_drop_ply: 30,
-            temperature_low:    0.0,
-            resign_threshold:  -0.9,
-            resign_min_ply:     30,
-            resign_consecutive:  5,
-            max_moves:         512,
-            dirichlet_alpha:   0.15,
+            temperature_low: 0.0,
+            resign_threshold: -0.9,
+            resign_min_ply: 30,
+            resign_consecutive: 5,
+            max_moves: 512,
+            dirichlet_alpha: 0.15,
             dirichlet_epsilon: 0.25,
-            c_puct:            1.0,
+            c_puct: 1.0,
         }
     }
 }
@@ -150,13 +150,13 @@ pub fn play_game(
     rng: &mut impl Rng,
 ) -> SelfPlayResult {
     let base_cfg = MctsConfig {
-        c_puct:            config.c_puct,
-        rollout_depth:     200, // unused — network replaces rollouts
-        dirichlet_alpha:   config.dirichlet_alpha,
+        c_puct: config.c_puct,
+        rollout_depth: 200, // unused — network replaces rollouts
+        dirichlet_alpha: config.dirichlet_alpha,
         dirichlet_epsilon: config.dirichlet_epsilon,
-        dirichlet_noise:   true, // always on during self-play
-        temperature:       config.temperature_high,
-        batch_size:        8,
+        dirichlet_noise: true, // always on during self-play
+        temperature: config.temperature_high,
+        batch_size: 8,
     };
 
     let mut board = Board::startpos();
@@ -184,13 +184,16 @@ pub fn play_game(
             config.temperature_low
         };
 
-        let cfg = MctsConfig { temperature, ..base_cfg.clone() };
+        let cfg = MctsConfig {
+            temperature,
+            ..base_cfg.clone()
+        };
 
         // Use a counter to distinguish the root eval (call 0) from leaf evals
         // (calls 1…N) inside mcts_search_with_evaluator.  This lets us capture
         // the network's value estimate at the root without a second forward pass.
-        let call_count  = Cell::new(0u32);
-        let root_value  = Cell::new(0.0f32);
+        let call_count = Cell::new(0u32);
+        let root_value = Cell::new(0.0f32);
 
         let mv = tch::no_grad(|| {
             mcts_search_with_evaluator(
@@ -241,13 +244,21 @@ pub fn play_game(
     // resigned if resigned=true).
     let outcome_for_black: f32 = if resigned {
         // The side that would move next is the one that resigned.
-        if board.side_to_move == Color::Black { -1.0 } else { 1.0 }
+        if board.side_to_move == Color::Black {
+            -1.0
+        } else {
+            1.0
+        }
     } else {
         let mut probe = Vec::new();
         generate_legal_moves(&mut board, &mut probe);
         if probe.is_empty() {
             // No legal moves → the side to move is mated.
-            if board.side_to_move == Color::Black { -1.0 } else { 1.0 }
+            if board.side_to_move == Color::Black {
+                -1.0
+            } else {
+                1.0
+            }
         } else {
             0.0 // draw by move limit
         }
@@ -269,7 +280,10 @@ pub fn play_game(
         })
         .collect();
 
-    SelfPlayResult { records, outcome: outcome_for_black }
+    SelfPlayResult {
+        records,
+        outcome: outcome_for_black,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -284,14 +298,14 @@ mod tests {
 
     fn small_config() -> SelfPlayConfig {
         SelfPlayConfig {
-            num_simulations:    4,
-            temperature_high:   1.0,
+            num_simulations: 4,
+            temperature_high: 1.0,
             temperature_drop_ply: 10,
-            temperature_low:    0.0,
-            resign_threshold:  -0.9,
-            resign_min_ply:     20, // won't trigger in a short game
-            resign_consecutive:  3,
-            max_moves:          20,
+            temperature_low: 0.0,
+            resign_threshold: -0.9,
+            resign_min_ply: 20, // won't trigger in a short game
+            resign_consecutive: 3,
+            max_moves: 20,
             ..SelfPlayConfig::default()
         }
     }
@@ -300,10 +314,10 @@ mod tests {
 
     #[test]
     fn test_visit_distribution_sums_to_one() {
-        use crate::mcts::{Arena, Node, NO_PARENT};
-        use crate::nn::move_index::NUM_ACTIONS;
         use crate::board::Board;
         use crate::mcts::search::expand;
+        use crate::mcts::{Arena, NO_PARENT, Node};
+        use crate::nn::move_index::NUM_ACTIONS;
 
         let mut board = Board::startpos();
         let mut arena = Arena::new(512);
@@ -327,9 +341,9 @@ mod tests {
 
     #[test]
     fn test_visit_distribution_zero_visits_returns_zeros() {
-        use crate::mcts::{Arena, Node, NO_PARENT};
         use crate::board::Board;
         use crate::mcts::search::expand;
+        use crate::mcts::{Arena, NO_PARENT, Node};
 
         let mut board = Board::startpos();
         let mut arena = Arena::new(512);
@@ -343,9 +357,9 @@ mod tests {
 
     #[test]
     fn test_visit_distribution_correct_action_slot() {
-        use crate::mcts::{Arena, Node, NO_PARENT};
         use crate::board::Board;
         use crate::mcts::search::expand;
+        use crate::mcts::{Arena, NO_PARENT, Node};
         use crate::nn::move_to_index;
 
         let mut board = Board::startpos();
@@ -381,7 +395,10 @@ mod tests {
         let config = small_config();
         let mut rng = rand::thread_rng();
         let result = play_game(&net, &config, Device::Cpu, &mut rng);
-        assert!(!result.records.is_empty(), "play_game should return at least one record");
+        assert!(
+            !result.records.is_empty(),
+            "play_game should return at least one record"
+        );
     }
 
     #[test]
@@ -456,7 +473,7 @@ mod tests {
         let result = play_game(&net, &config, Device::Cpu, &mut rng);
 
         // If the game ended decisively, all z are ±1 (no mixing of 0 and ±1).
-        let has_zero    = result.records.iter().any(|(_, _, z)| *z == 0.0);
+        let has_zero = result.records.iter().any(|(_, _, z)| *z == 0.0);
         let has_nonzero = result.records.iter().any(|(_, _, z)| *z != 0.0);
         if has_zero {
             assert!(!has_nonzero, "draw outcome should make all z = 0");
@@ -491,11 +508,11 @@ mod tests {
     fn test_outcome_resign_is_decisive() {
         let (_vs, net) = build_with_config(Device::Cpu, 8, 2);
         let config = SelfPlayConfig {
-            num_simulations:   4,
-            resign_threshold:  2.0, // always triggers (tanh output < 1.0 always)
-            resign_min_ply:    0,
+            num_simulations: 4,
+            resign_threshold: 2.0, // always triggers (tanh output < 1.0 always)
+            resign_min_ply: 0,
             resign_consecutive: 1,
-            max_moves:         50,
+            max_moves: 50,
             ..SelfPlayConfig::default()
         };
         let mut rng = rand::thread_rng();
@@ -513,11 +530,11 @@ mod tests {
     fn test_resign_z_consistent_with_outcome() {
         let (_vs, net) = build_with_config(Device::Cpu, 8, 2);
         let config = SelfPlayConfig {
-            num_simulations:   4,
-            resign_threshold:  2.0,
-            resign_min_ply:    0,
+            num_simulations: 4,
+            resign_threshold: 2.0,
+            resign_min_ply: 0,
             resign_consecutive: 1,
-            max_moves:         50,
+            max_moves: 50,
             ..SelfPlayConfig::default()
         };
         let mut rng = rand::thread_rng();
@@ -542,11 +559,11 @@ mod tests {
 
     fn immediate_resign_config(consecutive: u32) -> SelfPlayConfig {
         SelfPlayConfig {
-            num_simulations:   4,
-            resign_threshold:  2.0, // tanh output is always < 1 < 2, so always triggers
-            resign_min_ply:    0,
+            num_simulations: 4,
+            resign_threshold: 2.0, // tanh output is always < 1 < 2, so always triggers
+            resign_min_ply: 0,
             resign_consecutive: consecutive,
-            max_moves:         50,
+            max_moves: 50,
             ..SelfPlayConfig::default()
         }
     }
@@ -561,7 +578,10 @@ mod tests {
 
         assert_eq!(result.outcome, -1.0, "Black resigned → outcome must be −1");
         assert_eq!(result.records.len(), 1);
-        assert_eq!(result.records[0].2, -1.0, "Black-to-move record must carry z = −1");
+        assert_eq!(
+            result.records[0].2, -1.0,
+            "Black-to-move record must carry z = −1"
+        );
     }
 
     /// resign_consecutive=2 → resign fires on ply 1 (White to move).
@@ -573,10 +593,19 @@ mod tests {
         let mut rng = rand::thread_rng();
         let result = play_game(&net, &immediate_resign_config(2), Device::Cpu, &mut rng);
 
-        assert_eq!(result.outcome, 1.0, "White resigned → outcome must be +1 for Black");
+        assert_eq!(
+            result.outcome, 1.0,
+            "White resigned → outcome must be +1 for Black"
+        );
         assert_eq!(result.records.len(), 2);
-        assert_eq!(result.records[0].2,  1.0, "Black-to-move record must carry z = +1");
-        assert_eq!(result.records[1].2, -1.0, "White-to-move record must carry z = −1");
+        assert_eq!(
+            result.records[0].2, 1.0,
+            "Black-to-move record must carry z = +1"
+        );
+        assert_eq!(
+            result.records[1].2, -1.0,
+            "White-to-move record must carry z = −1"
+        );
     }
 
     /// In a decisive game, consecutive records always have opposite z values
@@ -643,14 +672,17 @@ mod tests {
     #[test]
     fn test_chosen_move_has_nonzero_policy_weight() {
         use crate::board::Board;
-        use crate::mcts::{Arena, MctsConfig};
         use crate::mcts::search::{eval_with_net, mcts_search_with_evaluator};
+        use crate::mcts::{Arena, MctsConfig};
         use std::cell::Cell;
 
         let (_vs, net) = build_with_config(Device::Cpu, 8, 2);
         let mut arena = Arena::new(50_000);
         let mut board = Board::startpos();
-        let cfg = MctsConfig { temperature: 1.0, ..MctsConfig::default() };
+        let cfg = MctsConfig {
+            temperature: 1.0,
+            ..MctsConfig::default()
+        };
         let mut rng = rand::thread_rng();
         let call_count = Cell::new(0u32);
 
@@ -687,11 +719,11 @@ mod tests {
 
     fn always_resign_config(min_ply: u32, consecutive: u32) -> SelfPlayConfig {
         SelfPlayConfig {
-            num_simulations:   4,
-            resign_threshold:  2.0, // always satisfied
-            resign_min_ply:    min_ply,
+            num_simulations: 4,
+            resign_threshold: 2.0, // always satisfied
+            resign_min_ply: min_ply,
             resign_consecutive: consecutive,
-            max_moves:         50,
+            max_moves: 50,
             ..SelfPlayConfig::default()
         }
     }
@@ -709,7 +741,10 @@ mod tests {
 
         // resign_consecutive = 1 → resign on the very first ply that satisfies the threshold.
         assert_eq!(result.records.len(), 1, "exactly one record before resign");
-        assert_eq!(result.outcome, -1.0, "Black (ply 0) resigned → outcome = −1");
+        assert_eq!(
+            result.outcome, -1.0,
+            "Black (ply 0) resigned → outcome = −1"
+        );
     }
 
     /// Resign requires N consecutive plies below the threshold.
@@ -722,7 +757,10 @@ mod tests {
 
         // Plies 0,1,2 all satisfy threshold → resign on ply 2 (Black to move).
         assert_eq!(result.records.len(), 3, "three records for plies 0–2");
-        assert_eq!(result.outcome, -1.0, "Black (ply 2) resigned → outcome = −1");
+        assert_eq!(
+            result.outcome, -1.0,
+            "Black (ply 2) resigned → outcome = −1"
+        );
     }
 
     /// resign_min_ply prevents early resignation.
@@ -736,7 +774,10 @@ mod tests {
         // Plies 0–4 are guarded by resign_min_ply=5 (counter stays 0).
         // Ply 5 (White, first eligible ply): counter=1 ≥ 1 → resign.
         assert_eq!(result.records.len(), 6, "six records for plies 0–5");
-        assert_eq!(result.outcome, 1.0, "White (ply 5) resigned → outcome = +1 for Black");
+        assert_eq!(
+            result.outcome, 1.0,
+            "White (ply 5) resigned → outcome = +1 for Black"
+        );
     }
 
     /// Resign never fires when the threshold is impossible to satisfy.
@@ -745,17 +786,20 @@ mod tests {
     fn test_resign_never_fires_when_threshold_not_met() {
         let (_vs, net) = build_with_config(Device::Cpu, 8, 2);
         let config = SelfPlayConfig {
-            num_simulations:   4,
-            resign_threshold:  -2.0, // never satisfied
-            resign_min_ply:    0,
+            num_simulations: 4,
+            resign_threshold: -2.0, // never satisfied
+            resign_min_ply: 0,
             resign_consecutive: 1,
-            max_moves:         4,
+            max_moves: 4,
             ..SelfPlayConfig::default()
         };
         let mut rng = rand::thread_rng();
         let result = play_game(&net, &config, Device::Cpu, &mut rng);
 
-        assert_eq!(result.outcome, 0.0, "threshold never met → draw by move limit");
+        assert_eq!(
+            result.outcome, 0.0,
+            "threshold never met → draw by move limit"
+        );
     }
 
     /// If the counter has not yet reached consecutive, resign must not fire.
@@ -764,11 +808,11 @@ mod tests {
     fn test_resign_requires_full_consecutive_count() {
         let (_vs, net) = build_with_config(Device::Cpu, 8, 2);
         let config = SelfPlayConfig {
-            num_simulations:   4,
-            resign_threshold:  2.0,
-            resign_min_ply:    0,
+            num_simulations: 4,
+            resign_threshold: 2.0,
+            resign_min_ply: 0,
             resign_consecutive: 3,
-            max_moves:         2, // loop ends after 2 plies, counter reaches 2 < 3
+            max_moves: 2, // loop ends after 2 plies, counter reaches 2 < 3
             ..SelfPlayConfig::default()
         };
         let mut rng = rand::thread_rng();
