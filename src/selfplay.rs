@@ -82,7 +82,7 @@ impl Default for SelfPlayConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Training record
+// Training record and game result
 // ---------------------------------------------------------------------------
 
 /// One training sample produced by self-play.
@@ -91,6 +91,17 @@ impl Default for SelfPlayConfig {
 /// - `.1` — MCTS visit-count distribution over `NUM_ACTIONS`.
 /// - `.2` — game outcome for the side to move (+1 win / −1 loss / 0 draw).
 pub type GameRecord = (Tensor, Vec<f32>, f32);
+
+/// Result of a complete self-play game.
+pub struct SelfPlayResult {
+    /// Training records, one per non-terminal position visited.
+    pub records: Vec<GameRecord>,
+    /// Game outcome from Black's perspective:
+    ///   +1.0  Black wins (White was checkmated or resigned)
+    ///   −1.0  White wins (Black was checkmated or resigned)
+    ///    0.0  Draw (move limit reached)
+    pub outcome: f32,
+}
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -137,7 +148,7 @@ pub fn play_game(
     config: &SelfPlayConfig,
     device: Device,
     rng: &mut impl Rng,
-) -> Vec<GameRecord> {
+) -> SelfPlayResult {
     let base_cfg = MctsConfig {
         c_puct:            config.c_puct,
         rollout_depth:     200, // unused — network replaces rollouts
@@ -246,7 +257,8 @@ pub fn play_game(
     //
     // Each record stores the side to move at that ply.  Convert the
     // Black-perspective outcome to the current-player perspective.
-    raw.into_iter()
+    let records = raw
+        .into_iter()
         .map(|(tensor, policy, side)| {
             let z = if side == Color::Black {
                 outcome_for_black
@@ -255,7 +267,9 @@ pub fn play_game(
             };
             (tensor, policy, z)
         })
-        .collect()
+        .collect();
+
+    SelfPlayResult { records, outcome: outcome_for_black }
 }
 
 // ---------------------------------------------------------------------------
@@ -366,8 +380,8 @@ mod tests {
         let (_vs, net) = build_with_config(Device::Cpu, 8, 2);
         let config = small_config();
         let mut rng = rand::thread_rng();
-        let records = play_game(&net, &config, Device::Cpu, &mut rng);
-        assert!(!records.is_empty(), "play_game should return at least one record");
+        let result = play_game(&net, &config, Device::Cpu, &mut rng);
+        assert!(!result.records.is_empty(), "play_game should return at least one record");
     }
 
     #[test]
@@ -375,8 +389,8 @@ mod tests {
         let (_vs, net) = build_with_config(Device::Cpu, 8, 2);
         let config = small_config();
         let mut rng = rand::thread_rng();
-        let records = play_game(&net, &config, Device::Cpu, &mut rng);
-        let (tensor, _, _) = &records[0];
+        let result = play_game(&net, &config, Device::Cpu, &mut rng);
+        let (tensor, _, _) = &result.records[0];
         assert_eq!(tensor.size(), vec![119, 9, 9]);
     }
 
@@ -385,8 +399,8 @@ mod tests {
         let (_vs, net) = build_with_config(Device::Cpu, 8, 2);
         let config = small_config();
         let mut rng = rand::thread_rng();
-        let records = play_game(&net, &config, Device::Cpu, &mut rng);
-        for (_, policy, _) in &records {
+        let result = play_game(&net, &config, Device::Cpu, &mut rng);
+        for (_, policy, _) in &result.records {
             assert_eq!(policy.len(), NUM_ACTIONS);
         }
     }
@@ -396,8 +410,8 @@ mod tests {
         let (_vs, net) = build_with_config(Device::Cpu, 8, 2);
         let config = small_config();
         let mut rng = rand::thread_rng();
-        let records = play_game(&net, &config, Device::Cpu, &mut rng);
-        for (_, policy, _) in &records {
+        let result = play_game(&net, &config, Device::Cpu, &mut rng);
+        for (_, policy, _) in &result.records {
             let sum: f32 = policy.iter().sum();
             assert!(
                 (sum - 1.0).abs() < 1e-4,
@@ -411,8 +425,8 @@ mod tests {
         let (_vs, net) = build_with_config(Device::Cpu, 8, 2);
         let config = small_config();
         let mut rng = rand::thread_rng();
-        let records = play_game(&net, &config, Device::Cpu, &mut rng);
-        for (_, _, z) in &records {
+        let result = play_game(&net, &config, Device::Cpu, &mut rng);
+        for (_, _, z) in &result.records {
             assert!(
                 *z == -1.0 || *z == 0.0 || *z == 1.0,
                 "value target must be -1, 0, or +1, got {z}"
@@ -425,30 +439,111 @@ mod tests {
         let (_vs, net) = build_with_config(Device::Cpu, 8, 2);
         let config = small_config(); // max_moves = 20
         let mut rng = rand::thread_rng();
-        let records = play_game(&net, &config, Device::Cpu, &mut rng);
+        let result = play_game(&net, &config, Device::Cpu, &mut rng);
         assert!(
-            records.len() <= config.max_moves,
+            result.records.len() <= config.max_moves,
             "records ({}) must not exceed max_moves ({})",
-            records.len(),
+            result.records.len(),
             config.max_moves,
         );
     }
 
     #[test]
     fn test_play_game_value_consistent_across_plies() {
-        // In a game with no draw, every record should have the same |z| = 1.
         let (_vs, net) = build_with_config(Device::Cpu, 8, 2);
         let config = small_config();
         let mut rng = rand::thread_rng();
-        let records = play_game(&net, &config, Device::Cpu, &mut rng);
+        let result = play_game(&net, &config, Device::Cpu, &mut rng);
 
         // If the game ended decisively, all z are ±1 (no mixing of 0 and ±1).
-        let has_zero = records.iter().any(|(_, _, z)| *z == 0.0);
-        let has_nonzero = records.iter().any(|(_, _, z)| *z != 0.0);
-        // If any record has z=0, all must (draw outcome is uniform).
+        let has_zero    = result.records.iter().any(|(_, _, z)| *z == 0.0);
+        let has_nonzero = result.records.iter().any(|(_, _, z)| *z != 0.0);
         if has_zero {
             assert!(!has_nonzero, "draw outcome should make all z = 0");
         }
+    }
+
+    // ----- outcome-specific tests -----
+
+    /// Draw by move limit: outcome must be 0.0 and all z values must be 0.0.
+    #[test]
+    fn test_outcome_draw_by_move_limit() {
+        let (_vs, net) = build_with_config(Device::Cpu, 8, 2);
+        // max_moves = 2 guarantees a draw: no game ends that quickly.
+        let config = SelfPlayConfig {
+            num_simulations: 4,
+            max_moves: 2,
+            resign_min_ply: 999, // no resign
+            ..SelfPlayConfig::default()
+        };
+        let mut rng = rand::thread_rng();
+        let result = play_game(&net, &config, Device::Cpu, &mut rng);
+
+        assert_eq!(result.outcome, 0.0, "move-limit game must be a draw");
+        for (_, _, z) in &result.records {
+            assert_eq!(*z, 0.0, "all z values must be 0 in a draw");
+        }
+    }
+
+    /// Resign: when the resign threshold is impossible to avoid, the first move
+    /// triggers resignation and the outcome is decisive (±1.0).
+    #[test]
+    fn test_outcome_resign_is_decisive() {
+        let (_vs, net) = build_with_config(Device::Cpu, 8, 2);
+        let config = SelfPlayConfig {
+            num_simulations:   4,
+            resign_threshold:  2.0, // always triggers (tanh output < 1.0 always)
+            resign_min_ply:    0,
+            resign_consecutive: 1,
+            max_moves:         50,
+            ..SelfPlayConfig::default()
+        };
+        let mut rng = rand::thread_rng();
+        let result = play_game(&net, &config, Device::Cpu, &mut rng);
+
+        assert!(
+            result.outcome == 1.0 || result.outcome == -1.0,
+            "resign must produce a decisive outcome, got {}",
+            result.outcome
+        );
+    }
+
+    /// After a resign the outcome must be reflected in every z value.
+    #[test]
+    fn test_resign_z_consistent_with_outcome() {
+        let (_vs, net) = build_with_config(Device::Cpu, 8, 2);
+        let config = SelfPlayConfig {
+            num_simulations:   4,
+            resign_threshold:  2.0,
+            resign_min_ply:    0,
+            resign_consecutive: 1,
+            max_moves:         50,
+            ..SelfPlayConfig::default()
+        };
+        let mut rng = rand::thread_rng();
+        let result = play_game(&net, &config, Device::Cpu, &mut rng);
+
+        // Every z must be ±1; none should be 0 in a resigned game.
+        for (_, _, z) in &result.records {
+            assert!(
+                *z == 1.0 || *z == -1.0,
+                "resigned game must have z ∈ {{-1, +1}}, got {z}"
+            );
+        }
+    }
+
+    /// outcome is always one of the three legal values.
+    #[test]
+    fn test_outcome_is_legal_value() {
+        let (_vs, net) = build_with_config(Device::Cpu, 8, 2);
+        let config = small_config();
+        let mut rng = rand::thread_rng();
+        let result = play_game(&net, &config, Device::Cpu, &mut rng);
+        assert!(
+            result.outcome == -1.0 || result.outcome == 0.0 || result.outcome == 1.0,
+            "outcome must be -1, 0, or +1, got {}",
+            result.outcome
+        );
     }
 
     /// The move chosen by MCTS must appear in the recorded policy distribution.
@@ -501,12 +596,12 @@ mod tests {
         let (_vs, net) = build_with_config(Device::Cpu, 8, 2);
         let config = small_config();
         let mut rng = rand::thread_rng();
-        let records = play_game(&net, &config, Device::Cpu, &mut rng);
+        let result = play_game(&net, &config, Device::Cpu, &mut rng);
 
-        if records.len() < 2 {
+        if result.records.len() < 2 {
             return; // game ended on the first move — nothing to compare
         }
-        for w in records.windows(2) {
+        for w in result.records.windows(2) {
             let (t0, _, _) = &w[0];
             let (t1, _, _) = &w[1];
             let max_diff = (t0 - t1).abs().max().double_value(&[]);
