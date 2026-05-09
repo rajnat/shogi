@@ -450,4 +450,70 @@ mod tests {
             assert!(!has_nonzero, "draw outcome should make all z = 0");
         }
     }
+
+    /// The move chosen by MCTS must appear in the recorded policy distribution.
+    ///
+    /// This is the central invariant of the data pipeline: the policy target
+    /// π recorded for training always assigns non-zero weight to the move
+    /// that was actually played.
+    #[test]
+    fn test_chosen_move_has_nonzero_policy_weight() {
+        use crate::board::Board;
+        use crate::mcts::{Arena, MctsConfig};
+        use crate::mcts::search::{eval_with_net, mcts_search_with_evaluator};
+        use std::cell::Cell;
+
+        let (_vs, net) = build_with_config(Device::Cpu, 8, 2);
+        let mut arena = Arena::new(50_000);
+        let mut board = Board::startpos();
+        let cfg = MctsConfig { temperature: 1.0, ..MctsConfig::default() };
+        let mut rng = rand::thread_rng();
+        let call_count = Cell::new(0u32);
+
+        let mv = tch::no_grad(|| {
+            mcts_search_with_evaluator(
+                &mut arena,
+                &mut board,
+                8, // small but enough to build the tree
+                &cfg,
+                &mut rng,
+                |b| {
+                    let r = eval_with_net(&net, Device::Cpu, b);
+                    call_count.set(call_count.get() + 1);
+                    r
+                },
+            )
+        });
+
+        let chosen = mv.expect("startpos is not terminal");
+        let policy = visit_distribution(&arena, 0);
+        let slot = move_to_index(chosen);
+        assert!(
+            policy[slot] > 0.0,
+            "chosen move (slot {slot}) must have non-zero weight in policy, got {:.6}",
+            policy[slot]
+        );
+    }
+
+    /// Each move changes the board — consecutive records should have different tensors.
+    #[test]
+    fn test_sequential_records_have_distinct_boards() {
+        let (_vs, net) = build_with_config(Device::Cpu, 8, 2);
+        let config = small_config();
+        let mut rng = rand::thread_rng();
+        let records = play_game(&net, &config, Device::Cpu, &mut rng);
+
+        if records.len() < 2 {
+            return; // game ended on the first move — nothing to compare
+        }
+        for w in records.windows(2) {
+            let (t0, _, _) = &w[0];
+            let (t1, _, _) = &w[1];
+            let max_diff = (t0 - t1).abs().max().double_value(&[]);
+            assert!(
+                max_diff > 0.0,
+                "consecutive board tensors should differ (max diff = {max_diff})"
+            );
+        }
+    }
 }
