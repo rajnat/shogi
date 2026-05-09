@@ -1,19 +1,8 @@
 /// Training step for AlphaZero-style self-play training.
-///
-/// `Trainer` owns the master network and optimizer and exposes one method per
-/// training-step bullet:
-///
-///   ✓ sample_batch        — draw a random batch from the replay buffer  (bullet 1)
-///   • forward             — run the network in training mode             (bullet 2)
-///   • policy_loss         — cross-entropy vs MCTS visit distribution     (bullet 3)
-///   • value_loss          — MSE vs game outcome                         (bullet 4)
-///   • total_loss          — weighted sum + L2 weight decay               (bullet 5)
-///   • step                — backward pass + optimizer update             (bullet 6)
-///   • log                 — print losses every N steps                   (bullet 7)
 use std::sync::{Arc, Mutex};
 
 use rand::Rng;
-use tch::{nn, nn::OptimizerConfig, Device, Tensor};
+use tch::{Device, Tensor, nn, nn::OptimizerConfig};
 
 use crate::nn::{Net, checkpoint::build_with_config};
 use crate::replay_buffer::ReplayBuffer;
@@ -73,7 +62,14 @@ impl Trainer {
         }
         .build(&vs, config.learning_rate)
         .expect("failed to build Adam optimizer");
-        Trainer { vs, net, opt, device, config, step: 0 }
+        Trainer {
+            vs,
+            net,
+            opt,
+            device,
+            config,
+            step: 0,
+        }
     }
 
     /// Draw one mini-batch from `buffer` and move it to the training device.
@@ -97,6 +93,17 @@ impl Trainer {
             self.config.min_buffer_size,
         );
         buf.sample_batch(self.config.batch_size, self.device, rng)
+    }
+
+    /// Run `boards` through the network in training mode.
+    ///
+    /// Returns `(policy_logits, values)`:
+    /// - `policy_logits`: `[B, NUM_ACTIONS]` — raw logits (no softmax).
+    /// - `values`:        `[B, 1]`           — tanh output ∈ (−1, 1).
+    ///
+    /// BatchNorm running stats are updated and dropout (if any) is active.
+    pub fn forward(&self, boards: &Tensor) -> (Tensor, Tensor) {
+        self.net.forward_t(boards, true)
     }
 
     /// Returns the minimum buffer size required before training can start.
@@ -166,7 +173,10 @@ mod tests {
         let buf = filled_buffer(t.min_buffer_size());
         let mut rng = StdRng::seed_from_u64(0);
         let (_, policies, _) = t.sample_batch(&buf, &mut rng);
-        assert_eq!(policies.size(), vec![t.batch_size() as i64, NUM_ACTIONS as i64]);
+        assert_eq!(
+            policies.size(),
+            vec![t.batch_size() as i64, NUM_ACTIONS as i64]
+        );
     }
 
     #[test]
@@ -186,7 +196,10 @@ mod tests {
         let (_, _, values) = t.sample_batch(&buf, &mut rng);
         let min = values.min().double_value(&[]);
         let max = values.max().double_value(&[]);
-        assert!(min >= -1.0 && max <= 1.0, "values out of range: [{min}, {max}]");
+        assert!(
+            min >= -1.0 && max <= 1.0,
+            "values out of range: [{min}, {max}]"
+        );
     }
 
     #[test]
@@ -204,5 +217,52 @@ mod tests {
         assert_eq!(t.batch_size(), 4);
         assert_eq!(t.min_buffer_size(), 4);
         assert_eq!(t.step, 0);
+    }
+
+    fn sample(t: &Trainer) -> (Tensor, Tensor, Tensor) {
+        let buf = filled_buffer(t.min_buffer_size());
+        let mut rng = StdRng::seed_from_u64(0);
+        t.sample_batch(&buf, &mut rng)
+    }
+
+    #[test]
+    fn test_forward_policy_shape() {
+        let t = trainer();
+        let (boards, _, _) = sample(&t);
+        let (policy, _) = t.forward(&boards);
+        assert_eq!(
+            policy.size(),
+            vec![t.batch_size() as i64, NUM_ACTIONS as i64]
+        );
+    }
+
+    #[test]
+    fn test_forward_value_shape() {
+        let t = trainer();
+        let (boards, _, _) = sample(&t);
+        let (_, value) = t.forward(&boards);
+        assert_eq!(value.size(), vec![t.batch_size() as i64, 1]);
+    }
+
+    #[test]
+    fn test_forward_value_in_tanh_range() {
+        let t = trainer();
+        let (boards, _, _) = sample(&t);
+        let (_, value) = t.forward(&boards);
+        let min = value.min().double_value(&[]);
+        let max = value.max().double_value(&[]);
+        assert!(
+            min > -1.0 && max < 1.0,
+            "value outside (-1, 1): [{min}, {max}]"
+        );
+    }
+
+    #[test]
+    fn test_forward_policy_finite() {
+        let t = trainer();
+        let (boards, _, _) = sample(&t);
+        let (policy, _) = t.forward(&boards);
+        assert_eq!(policy.isnan().any().int64_value(&[]), 0, "policy has NaN");
+        assert_eq!(policy.isinf().any().int64_value(&[]), 0, "policy has Inf");
     }
 }

@@ -17,10 +17,6 @@ use crate::nn::{Net, checkpoint::build_with_config};
 use crate::replay_buffer::ReplayBuffer;
 use crate::selfplay::{SelfPlayConfig, play_game};
 
-// ---------------------------------------------------------------------------
-// Weight snapshot helpers (bullet 4)
-// ---------------------------------------------------------------------------
-
 /// One deep copy of every VarStore variable, keyed by name.
 ///
 /// `Tensor` is `Send` but not `Sync` in tch-0.24, so each worker slot holds
@@ -366,8 +362,6 @@ mod tests {
         assert!(buffer.lock().unwrap().len() >= 2);
     }
 
-    // ----- snapshot / apply (bullet 4 unit tests) -----
-
     #[test]
     fn test_snapshot_is_independent_of_master() {
         let (master_vs, _) = make_master();
@@ -413,7 +407,10 @@ mod tests {
 
         let (p_after, _) = tch::no_grad(|| worker_net.forward_t(&xs, false));
         let diff = (&p_before - &p_after).abs().max().double_value(&[]);
-        assert!(diff > 1e-4, "apply_snapshot had no effect (diff={diff:.2e})");
+        assert!(
+            diff > 1e-4,
+            "apply_snapshot had no effect (diff={diff:.2e})"
+        );
     }
 
     #[test]
@@ -428,14 +425,15 @@ mod tests {
         let (pm2, _) = tch::no_grad(|| master_net2.forward_t(&xs, false));
         let (pw, _) = tch::no_grad(|| worker_net.forward_t(&xs, false));
         let diff2 = (&pm2 - &pw).abs().max().double_value(&[]);
-        assert!(diff2 < 1e-5, "worker doesn't match source after apply: {diff2:.2e}");
+        assert!(
+            diff2 < 1e-5,
+            "worker doesn't match source after apply: {diff2:.2e}"
+        );
 
         let (pm1, _) = tch::no_grad(|| master_net1.forward_t(&xs, false));
         let diff1 = (&pm1 - &pw).abs().max().double_value(&[]);
         assert!(diff1 > 1e-4, "worker still matches old master after apply");
     }
-
-    // ----- broadcast_weights (bullet 4 pool tests) -----
 
     #[test]
     fn test_broadcast_does_not_panic() {
