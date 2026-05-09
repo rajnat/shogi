@@ -17,3 +17,4 @@ pub mod selfplay;
 pub mod replay_buffer;
 pub mod worker;
 pub mod train;
+pub mod orchestrate;
