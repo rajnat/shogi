@@ -148,6 +148,30 @@ impl Trainer {
             .mean(tch::Kind::Float)
     }
 
+    /// Total loss: policy cross-entropy + value MSE.
+    ///
+    /// ```text
+    /// L = L_policy + L_value
+    /// ```
+    ///
+    /// L2 weight decay is applied by the Adam optimizer (via `TrainConfig::weight_decay`)
+    /// and does not appear as an explicit term in the returned tensor.
+    ///
+    /// Returns `(total, policy_component, value_component)` so the caller can
+    /// log each term independently without recomputing them.
+    pub fn total_loss(
+        &self,
+        policy_logits: &Tensor,
+        policy_targets: &Tensor,
+        pred_values: &Tensor,
+        value_targets: &Tensor,
+    ) -> (Tensor, Tensor, Tensor) {
+        let lp = self.policy_loss(policy_logits, policy_targets);
+        let lv = self.value_loss(pred_values, value_targets);
+        let total = &lp + &lv;
+        (total, lp, lv)
+    }
+
     /// Returns the configured batch size.
     pub fn batch_size(&self) -> usize {
         self.config.batch_size
@@ -484,6 +508,84 @@ mod tests {
         assert!(
             loss < 1e-3,
             "loss should be near 0 for perfect prediction, got {loss:.6}"
+        );
+    }
+
+    // ----- total_loss -----
+
+    fn dummy_logits_and_targets(b: i64) -> (Tensor, Tensor, Tensor, Tensor) {
+        let logits = Tensor::randn([b, NUM_ACTIONS as i64], (tch::Kind::Float, Device::Cpu));
+        let target_p = uniform_policy(b);
+        let pred_v = batch_values(&vec![0.5f32; b as usize]);
+        let target_v = batch_values(&vec![1.0f32; b as usize]);
+        (logits, target_p, pred_v, target_v)
+    }
+
+    #[test]
+    fn test_total_loss_is_scalar() {
+        let t = trainer();
+        let (logits, tp, pv, tv) = dummy_logits_and_targets(t.batch_size() as i64);
+        let (total, _, _) = t.total_loss(&logits, &tp, &pv, &tv);
+        assert_eq!(
+            total.size(),
+            Vec::<i64>::new(),
+            "total loss should be a scalar"
+        );
+    }
+
+    #[test]
+    fn test_total_loss_equals_sum_of_components() {
+        let t = trainer();
+        let (logits, tp, pv, tv) = dummy_logits_and_targets(t.batch_size() as i64);
+        let (total, lp, lv) = t.total_loss(&logits, &tp, &pv, &tv);
+        let expected = lp.double_value(&[]) + lv.double_value(&[]);
+        let got = total.double_value(&[]);
+        assert!(
+            (got - expected).abs() < 1e-6,
+            "total ({got:.6}) != lp + lv ({expected:.6})"
+        );
+    }
+
+    #[test]
+    fn test_total_loss_non_negative() {
+        let t = trainer();
+        let (logits, tp, pv, tv) = dummy_logits_and_targets(t.batch_size() as i64);
+        let (total, _, _) = t.total_loss(&logits, &tp, &pv, &tv);
+        assert!(total.double_value(&[]) >= 0.0, "total loss must be ≥ 0");
+    }
+
+    #[test]
+    fn test_total_loss_components_independently_accessible() {
+        // Verify lp and lv match what the individual methods return.
+        let t = trainer();
+        let b = t.batch_size() as i64;
+        let (logits, tp, pv, tv) = dummy_logits_and_targets(b);
+        let (_, lp, lv) = t.total_loss(&logits, &tp, &pv, &tv);
+        let lp_direct = t.policy_loss(&logits, &tp).double_value(&[]);
+        let lv_direct = t.value_loss(&pv, &tv).double_value(&[]);
+        assert!(
+            (lp.double_value(&[]) - lp_direct).abs() < 1e-6,
+            "policy component mismatch"
+        );
+        assert!(
+            (lv.double_value(&[]) - lv_direct).abs() < 1e-6,
+            "value component mismatch"
+        );
+    }
+
+    #[test]
+    fn test_total_loss_dominated_by_larger_component() {
+        // When value loss is zero, total should equal policy loss.
+        let t = trainer();
+        let b = t.batch_size() as i64;
+        let logits = Tensor::randn([b, NUM_ACTIONS as i64], (tch::Kind::Float, Device::Cpu));
+        let tp = uniform_policy(b);
+        let perfect_v = batch_values(&vec![0.5f32; b as usize]);
+        let (total, lp, _) = t.total_loss(&logits, &tp, &perfect_v, &perfect_v);
+        let diff = (total.double_value(&[]) - lp.double_value(&[])).abs();
+        assert!(
+            diff < 1e-6,
+            "when value loss = 0, total should equal policy loss"
         );
     }
 }
