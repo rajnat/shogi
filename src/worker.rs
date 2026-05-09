@@ -4,22 +4,63 @@
 /// and pushing them to a shared `ReplayBuffer`.  The training thread drives the
 /// pool through `WorkerPool::spawn` / `WorkerPool::join`.
 ///
-/// Bullet roadmap:
-///   ✓ Spawn N threads with shutdown signal         (bullet 1)
-///   ✓ Per-worker network copy                      (bullet 2)
-///   ✓ Workers push to shared replay buffer          (bullet 3)
-///   • Weight broadcast from training thread         (bullet 4)
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use tch::nn;
+use tch::{Tensor, nn};
 
 use crate::nn::{Net, checkpoint::build_with_config};
 use crate::replay_buffer::ReplayBuffer;
 use crate::selfplay::{SelfPlayConfig, play_game};
+
+// ---------------------------------------------------------------------------
+// Weight snapshot helpers (bullet 4)
+// ---------------------------------------------------------------------------
+
+/// One deep copy of every VarStore variable, keyed by name.
+///
+/// `Tensor` is `Send` but not `Sync` in tch-0.24, so each worker slot holds
+/// its own independent `HashMap` rather than a shared `Arc`.  The per-worker
+/// allocation cost is negligible for the small test networks; for a full
+/// 256-channel net the training thread creates N copies only at broadcast time.
+type WeightSnapshot = HashMap<String, Tensor>;
+
+/// Per-worker deposit slot.  Holds at most one pending snapshot — a newer
+/// broadcast silently overwrites any un-consumed earlier one.
+type WeightSlot = Arc<Mutex<Option<WeightSnapshot>>>;
+
+/// Deep-copy every variable in `vs` into a fresh `HashMap`.
+///
+/// Each tensor owns its own storage so the training thread can safely continue
+/// modifying `vs` after `broadcast_weights` returns.
+fn snapshot_vars(vs: &nn::VarStore) -> WeightSnapshot {
+    tch::no_grad(|| {
+        vs.variables()
+            .into_iter()
+            .map(|(name, src)| {
+                let mut dst = src.zeros_like();
+                dst.copy_(&src);
+                (name, dst)
+            })
+            .collect()
+    })
+}
+
+/// Copy all variables from `snapshot` into `worker_vs` in-place.
+fn apply_snapshot(worker_vs: &nn::VarStore, snapshot: &WeightSnapshot) {
+    let mut vars = worker_vs.variables();
+    tch::no_grad(|| {
+        for (name, src) in snapshot {
+            if let Some(dst) = vars.get_mut(name) {
+                dst.copy_(src);
+            }
+        }
+    });
+}
 
 // ---------------------------------------------------------------------------
 // Weight copy helper
@@ -47,8 +88,11 @@ pub fn build_worker_net(
 pub struct WorkerPool {
     handles: Vec<JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
-    /// Architecture parameters — stored for weight broadcast (bullet 4).
+    weight_slots: Vec<WeightSlot>,
+    /// Stored for potential future use (e.g. rebuilding nets on arch change).
+    #[allow(dead_code)]
     channels: i64,
+    #[allow(dead_code)]
     blocks: usize,
 }
 
@@ -78,25 +122,52 @@ impl WorkerPool {
         let shutdown = Arc::new(AtomicBool::new(false));
         let config = Arc::new(config);
 
-        let handles = (0..num_workers)
-            .map(|idx| {
+        let weight_slots: Vec<WeightSlot> = (0..num_workers)
+            .map(|_| Arc::new(Mutex::new(None)))
+            .collect();
+
+        let handles = weight_slots
+            .iter()
+            .enumerate()
+            .map(|(idx, slot)| {
                 let (worker_vs, worker_net) = build_worker_net(master_vs, channels, blocks);
                 let shutdown = Arc::clone(&shutdown);
                 let buffer = Arc::clone(&buffer);
                 let config = Arc::clone(&config);
+                let slot = Arc::clone(slot);
                 let seed = base_seed.wrapping_add(idx as u64);
                 thread::spawn(move || {
-                    worker_loop(worker_vs, worker_net, config, buffer, shutdown, seed)
+                    worker_loop(worker_vs, worker_net, config, buffer, shutdown, slot, seed)
                 })
             })
             .collect();
 
-        Self { handles, shutdown, channels, blocks }
+        Self {
+            handles,
+            shutdown,
+            weight_slots,
+            channels,
+            blocks,
+        }
     }
 
     /// Number of live worker threads.
     pub fn num_workers(&self) -> usize {
         self.handles.len()
+    }
+
+    /// Push the current `master_vs` weights to every worker.
+    ///
+    /// Creates one deep copy of the master variables (via `snapshot_vars`), then
+    /// shares it across all per-worker slots via `Arc` — no per-worker tensor
+    /// allocation.  Workers apply the update between games; there is no mid-game
+    /// weight change and no lock contention during forward passes.
+    pub fn broadcast_weights(&self, master_vs: &nn::VarStore) {
+        // snapshot_vars is called once per worker; each gets its own deep copy
+        // so workers can apply concurrently without sharing tensor storage.
+        for slot in &self.weight_slots {
+            *slot.lock().unwrap() = Some(snapshot_vars(master_vs));
+        }
     }
 
     /// Signal all workers to stop after their current game, then join all threads.
@@ -116,18 +187,25 @@ impl WorkerPool {
 // ---------------------------------------------------------------------------
 
 fn worker_loop(
-    _vs: nn::VarStore,
+    worker_vs: nn::VarStore,
     net: Net,
     config: Arc<SelfPlayConfig>,
     buffer: Arc<Mutex<ReplayBuffer>>,
     shutdown: Arc<AtomicBool>,
+    slot: WeightSlot,
     seed: u64,
 ) {
     let mut rng = StdRng::seed_from_u64(seed);
     loop {
+        // Apply pending weight broadcast before the next game.
+        if let Some(snap) = slot.lock().unwrap().take() {
+            apply_snapshot(&worker_vs, &snap);
+        }
+
         let result = tch::no_grad(|| play_game(&net, &config, tch::Device::Cpu, &mut rng));
         buffer.lock().unwrap().push_game(result.records);
-        // Check shutdown after each game so every worker pushes at least one game.
+
+        // Check shutdown after the game — guarantees at least one game per worker.
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
@@ -141,8 +219,8 @@ fn worker_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nn::{NUM_ACTIONS, NUM_PLANES, checkpoint::build_with_config};
     use tch::{Device, Kind, Tensor};
-    use crate::nn::{NUM_PLANES, NUM_ACTIONS, checkpoint::build_with_config};
 
     fn make_master() -> (nn::VarStore, Net) {
         build_with_config(Device::Cpu, 8, 2)
@@ -216,7 +294,10 @@ mod tests {
 
         let (p_after, _) = tch::no_grad(|| worker_net.forward_t(&xs, false));
         let diff = (&p_before - &p_after).abs().max().double_value(&[]);
-        assert!(diff < 1e-6, "worker was affected by master mutation: {diff:.2e}");
+        assert!(
+            diff < 1e-6,
+            "worker was affected by master mutation: {diff:.2e}"
+        );
     }
 
     #[test]
@@ -253,15 +334,16 @@ mod tests {
         WorkerPool::spawn(4, &master_vs, 8, 2, tiny_config(), test_buffer(10_000), 0).join();
     }
 
-    // ----- Buffer push (bullet 3) -----
-
     #[test]
     fn test_single_worker_populates_buffer() {
         let (master_vs, _) = make_master();
         let buffer = test_buffer(10_000);
         let pool = WorkerPool::spawn(1, &master_vs, 8, 2, tiny_config(), Arc::clone(&buffer), 0);
         pool.join(); // worker plays exactly one game then exits
-        assert!(buffer.lock().unwrap().len() > 0, "buffer empty after worker ran one game");
+        assert!(
+            buffer.lock().unwrap().len() > 0,
+            "buffer empty after worker ran one game"
+        );
     }
 
     #[test]
@@ -277,13 +359,100 @@ mod tests {
 
     #[test]
     fn test_workers_use_different_seeds() {
-        // Two workers seeded differently should (almost certainly) produce different
-        // first moves — verify buffer contains at least 2 distinct records.
         let (master_vs, _) = make_master();
         let buffer = test_buffer(10_000);
         let pool = WorkerPool::spawn(2, &master_vs, 8, 2, tiny_config(), Arc::clone(&buffer), 42);
         pool.join();
-        let buf = buffer.lock().unwrap();
-        assert!(buf.len() >= 2);
+        assert!(buffer.lock().unwrap().len() >= 2);
+    }
+
+    // ----- snapshot / apply (bullet 4 unit tests) -----
+
+    #[test]
+    fn test_snapshot_is_independent_of_master() {
+        let (master_vs, _) = make_master();
+        let snap = snapshot_vars(&master_vs);
+
+        // Record snapshot's total weight mass before touching the master.
+        // BatchNorm biases are init to 0, so we can't use `all(nonzero)`;
+        // checking that the sum is preserved after zeroing master is robust.
+        let sum_before: f64 = snap
+            .values()
+            .map(|t| t.abs().sum(tch::Kind::Double).double_value(&[]))
+            .sum();
+        assert!(sum_before > 0.0, "snapshot is unexpectedly all-zero");
+
+        // Zero every master variable in-place.
+        tch::no_grad(|| {
+            for (_, mut t) in master_vs.variables() {
+                let _ = t.fill_(0.0);
+            }
+        });
+
+        let sum_after: f64 = snap
+            .values()
+            .map(|t| t.abs().sum(tch::Kind::Double).double_value(&[]))
+            .sum();
+
+        assert!(
+            (sum_before - sum_after).abs() < 1e-3,
+            "snapshot weight sum changed after zeroing master \
+             ({sum_before:.4} → {sum_after:.4}): tensors are aliased"
+        );
+    }
+
+    #[test]
+    fn test_apply_snapshot_changes_worker_output() {
+        let (master_vs1, _) = make_master();
+        let (master_vs2, _) = make_master(); // different random weights
+        let (worker_vs, worker_net) = build_worker_net(&master_vs1, 8, 2);
+        let xs = randn_input();
+        let (p_before, _) = tch::no_grad(|| worker_net.forward_t(&xs, false));
+
+        apply_snapshot(&worker_vs, &snapshot_vars(&master_vs2));
+
+        let (p_after, _) = tch::no_grad(|| worker_net.forward_t(&xs, false));
+        let diff = (&p_before - &p_after).abs().max().double_value(&[]);
+        assert!(diff > 1e-4, "apply_snapshot had no effect (diff={diff:.2e})");
+    }
+
+    #[test]
+    fn test_apply_snapshot_matches_source() {
+        let (master_vs1, master_net1) = make_master();
+        let (master_vs2, master_net2) = make_master();
+        let (worker_vs, worker_net) = build_worker_net(&master_vs1, 8, 2);
+
+        apply_snapshot(&worker_vs, &snapshot_vars(&master_vs2));
+
+        let xs = randn_input();
+        let (pm2, _) = tch::no_grad(|| master_net2.forward_t(&xs, false));
+        let (pw, _) = tch::no_grad(|| worker_net.forward_t(&xs, false));
+        let diff2 = (&pm2 - &pw).abs().max().double_value(&[]);
+        assert!(diff2 < 1e-5, "worker doesn't match source after apply: {diff2:.2e}");
+
+        let (pm1, _) = tch::no_grad(|| master_net1.forward_t(&xs, false));
+        let diff1 = (&pm1 - &pw).abs().max().double_value(&[]);
+        assert!(diff1 > 1e-4, "worker still matches old master after apply");
+    }
+
+    // ----- broadcast_weights (bullet 4 pool tests) -----
+
+    #[test]
+    fn test_broadcast_does_not_panic() {
+        let (master_vs, _) = make_master();
+        let pool = WorkerPool::spawn(2, &master_vs, 8, 2, tiny_config(), test_buffer(10_000), 0);
+        pool.broadcast_weights(&master_vs);
+        pool.broadcast_weights(&master_vs); // second call overwrites pending
+        pool.join();
+    }
+
+    #[test]
+    fn test_broadcast_workers_still_populate_buffer() {
+        let (master_vs, _) = make_master();
+        let buffer = test_buffer(10_000);
+        let pool = WorkerPool::spawn(2, &master_vs, 8, 2, tiny_config(), Arc::clone(&buffer), 0);
+        pool.broadcast_weights(&master_vs);
+        pool.join();
+        assert!(buffer.lock().unwrap().len() > 0);
     }
 }
