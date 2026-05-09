@@ -132,6 +132,22 @@ impl Trainer {
             .mean(tch::Kind::Float)
     }
 
+    /// Value loss: MSE between `pred_values` and `value_targets`.
+    ///
+    /// ```text
+    /// L_value = mean( (v_pred − z)² )
+    /// ```
+    ///
+    /// `pred_values`:   `[B, 1]` — network tanh output ∈ (−1, 1).
+    /// `value_targets`: `[B, 1]` — game outcome z ∈ {−1, 0, +1}.
+    ///
+    /// Returns a scalar tensor.
+    pub fn value_loss(&self, pred_values: &Tensor, value_targets: &Tensor) -> Tensor {
+        (pred_values - value_targets)
+            .pow_tensor_scalar(2)
+            .mean(tch::Kind::Float)
+    }
+
     /// Returns the configured batch size.
     pub fn batch_size(&self) -> usize {
         self.config.batch_size
@@ -368,6 +384,81 @@ mod tests {
         assert!(
             loss_good < loss_uniform,
             "matched logits ({loss_good:.4}) should have lower loss than uniform ({loss_uniform:.4})"
+        );
+    }
+
+    // ----- value_loss -----
+
+    fn scalar(v: f32) -> Tensor {
+        Tensor::from_slice(&[v]).reshape([1, 1])
+    }
+
+    fn batch_values(vals: &[f32]) -> Tensor {
+        let n = vals.len() as i64;
+        Tensor::from_slice(vals).reshape([n, 1])
+    }
+
+    #[test]
+    fn test_value_loss_is_scalar() {
+        let t = trainer();
+        let pred = batch_values(&[0.5, -0.3, 0.1, 0.9]);
+        let target = batch_values(&[1.0, -1.0, 0.0, 1.0]);
+        let loss = t.value_loss(&pred, &target);
+        assert_eq!(
+            loss.size(),
+            Vec::<i64>::new(),
+            "value loss should be a scalar"
+        );
+    }
+
+    #[test]
+    fn test_value_loss_non_negative() {
+        let t = trainer();
+        let pred = batch_values(&[0.5, -0.5, 0.0, 0.8]);
+        let target = batch_values(&[1.0, -1.0, 0.0, 1.0]);
+        let loss = t.value_loss(&pred, &target).double_value(&[]);
+        assert!(loss >= 0.0, "MSE must be ≥ 0, got {loss}");
+    }
+
+    #[test]
+    fn test_value_loss_zero_for_perfect_prediction() {
+        let t = trainer();
+        let vals = batch_values(&[1.0, -1.0, 0.0, 1.0]);
+        let loss = t.value_loss(&vals, &vals).double_value(&[]);
+        assert!(loss < 1e-6, "MSE(x, x) must be 0, got {loss:.2e}");
+    }
+
+    #[test]
+    fn test_value_loss_matches_manual_mse() {
+        let t = trainer();
+        let pred = &[0.3f32, -0.7, 0.5, -0.2];
+        let target = &[1.0f32, -1.0, 0.0, 1.0];
+        let manual: f64 = pred
+            .iter()
+            .zip(target.iter())
+            .map(|(p, z)| ((p - z) as f64).powi(2))
+            .sum::<f64>()
+            / 4.0;
+        let loss = t
+            .value_loss(&batch_values(pred), &batch_values(target))
+            .double_value(&[]);
+        assert!(
+            (loss - manual).abs() < 1e-5,
+            "MSE mismatch: got {loss:.6}, expected {manual:.6}"
+        );
+    }
+
+    #[test]
+    fn test_value_loss_increases_with_error() {
+        let t = trainer();
+        let target = scalar(1.0);
+        let close = scalar(0.9); // error = 0.1
+        let far = scalar(-0.9); // error = 1.9
+        let loss_close = t.value_loss(&close, &target).double_value(&[]);
+        let loss_far = t.value_loss(&far, &target).double_value(&[]);
+        assert!(
+            loss_far > loss_close,
+            "larger error should give larger loss: {loss_far:.4} vs {loss_close:.4}"
         );
     }
 
