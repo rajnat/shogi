@@ -50,6 +50,8 @@ pub struct Trainer {
     pub device: Device,
     config: TrainConfig,
     pub step: u64,
+    pub channels: i64,
+    pub blocks: usize,
 }
 
 impl Trainer {
@@ -69,6 +71,8 @@ impl Trainer {
             device,
             config,
             step: 0,
+            channels,
+            blocks,
         }
     }
 

@@ -287,6 +287,96 @@ pub fn play_game(
 }
 
 // ---------------------------------------------------------------------------
+// play_pit_game
+// ---------------------------------------------------------------------------
+
+/// Play one game between two distinct networks for evaluation purposes.
+///
+/// `net_black` controls Black (Sente, moves first); `net_white` controls White.
+/// Unlike `play_game`, no Dirichlet noise is added — this is pure evaluation.
+/// Returns the outcome from Black's perspective (+1 Black wins, −1 White wins, 0 draw).
+pub fn play_pit_game(
+    net_black: &Net,
+    net_white: &Net,
+    config: &SelfPlayConfig,
+    device: Device,
+    rng: &mut impl Rng,
+) -> f32 {
+    let base_cfg = MctsConfig {
+        c_puct: config.c_puct,
+        rollout_depth: 200,
+        dirichlet_alpha: config.dirichlet_alpha,
+        dirichlet_epsilon: 0.0, // no noise during evaluation
+        dirichlet_noise: false,
+        temperature: config.temperature_low,
+        batch_size: 8,
+    };
+
+    let mut board = Board::startpos();
+    let mut arena = Arena::new(200_000);
+
+    let mut resign_counter = 0u32;
+    let mut resigned = false;
+
+    for ply in 0..config.max_moves {
+        let mut legal = Vec::new();
+        generate_legal_moves(&mut board, &mut legal);
+        if legal.is_empty() {
+            break;
+        }
+
+        let net = if board.side_to_move == Color::Black { net_black } else { net_white };
+        let call_count = std::cell::Cell::new(0u32);
+        let root_value = std::cell::Cell::new(0.0f32);
+
+        let mv = tch::no_grad(|| {
+            mcts_search_with_evaluator(
+                &mut arena,
+                &mut board,
+                config.num_simulations,
+                &base_cfg,
+                rng,
+                |b| {
+                    let result = eval_with_net(net, device, b);
+                    if call_count.get() == 0 {
+                        root_value.set(result.value);
+                    }
+                    call_count.set(call_count.get() + 1);
+                    result
+                },
+            )
+        });
+
+        let Some(chosen_move) = mv else { break };
+
+        let v = root_value.get();
+        if ply >= config.resign_min_ply as usize && v < config.resign_threshold {
+            resign_counter += 1;
+            if resign_counter >= config.resign_consecutive {
+                resigned = true;
+                break;
+            }
+        } else {
+            resign_counter = 0;
+        }
+
+        make_move_full(&mut board, chosen_move);
+    }
+
+    if resigned {
+        if board.side_to_move == Color::Black { -1.0 } else { 1.0 }
+    } else {
+        let mut probe = Vec::new();
+        generate_legal_moves(&mut board, &mut probe);
+        if probe.is_empty() {
+            if board.side_to_move == Color::Black { -1.0 } else { 1.0 }
+        } else {
+            0.0
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
