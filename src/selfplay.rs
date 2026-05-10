@@ -95,6 +95,17 @@ impl Default for SelfPlayConfig {
 /// - `.2` — game outcome for the side to move (+1 win / −1 loss / 0 draw).
 pub type GameRecord = (Tensor, Vec<f32>, f32);
 
+/// Why a self-play game ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminationReason {
+    /// The side to move had no legal moves (checkmated).
+    Checkmate,
+    /// The side to move resigned after consecutive below-threshold evaluations.
+    Resign,
+    /// The game hit `max_moves` without a decisive result (draw).
+    MaxMoves,
+}
+
 /// Result of a complete self-play game.
 pub struct SelfPlayResult {
     /// Training records, one per non-terminal position visited.
@@ -104,6 +115,10 @@ pub struct SelfPlayResult {
     ///   −1.0  White wins (Black was checkmated or resigned)
     ///    0.0  Draw (move limit reached)
     pub outcome: f32,
+    /// How the game ended.
+    pub termination: TerminationReason,
+    /// Number of half-moves (plies) played; equal to `records.len()`.
+    pub plies: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -241,29 +256,23 @@ pub fn play_game(
         make_move_full(&mut board, chosen_move);
     }
 
-    // --- Determine outcome from Black's perspective ---
+    // --- Determine outcome and termination from Black's perspective ---
     //
     // `board.side_to_move` at exit tells us who would move next (or who
     // resigned if resigned=true).
-    let outcome_for_black: f32 = if resigned {
+    let (outcome_for_black, termination): (f32, TerminationReason) = if resigned {
         // The side that would move next is the one that resigned.
-        if board.side_to_move == Color::Black {
-            -1.0
-        } else {
-            1.0
-        }
+        let outcome = if board.side_to_move == Color::Black { -1.0 } else { 1.0 };
+        (outcome, TerminationReason::Resign)
     } else {
         let mut probe = Vec::new();
         generate_legal_moves(&mut board, &mut probe);
         if probe.is_empty() {
-            // No legal moves → the side to move is mated.
-            if board.side_to_move == Color::Black {
-                -1.0
-            } else {
-                1.0
-            }
+            // No legal moves → the side to move is checkmated.
+            let outcome = if board.side_to_move == Color::Black { -1.0 } else { 1.0 };
+            (outcome, TerminationReason::Checkmate)
         } else {
-            0.0 // draw by move limit
+            (0.0, TerminationReason::MaxMoves)
         }
     };
 
@@ -271,7 +280,7 @@ pub fn play_game(
     //
     // Each record stores the side to move at that ply.  Convert the
     // Black-perspective outcome to the current-player perspective.
-    let records = raw
+    let records: Vec<GameRecord> = raw
         .into_iter()
         .map(|(tensor, policy, side)| {
             let z = if side == Color::Black {
@@ -283,9 +292,12 @@ pub fn play_game(
         })
         .collect();
 
+    let plies = records.len();
     SelfPlayResult {
         records,
         outcome: outcome_for_black,
+        termination,
+        plies,
     }
 }
 
@@ -814,6 +826,49 @@ mod tests {
             "chosen move (slot {slot}) must have non-zero weight in policy, got {:.6}",
             policy[slot]
         );
+    }
+
+    // ----- termination reason and plies -----
+
+    #[test]
+    fn test_plies_matches_records_length() {
+        let (_vs, net) = build_with_config(Device::Cpu, 8, 2);
+        let config = small_config();
+        let mut rng = rand::thread_rng();
+        let result = play_game(&net, &config, Device::Cpu, &mut rng);
+        assert_eq!(result.plies, result.records.len());
+    }
+
+    #[test]
+    fn test_termination_max_moves() {
+        let (_vs, net) = build_with_config(Device::Cpu, 8, 2);
+        let config = SelfPlayConfig {
+            num_simulations: 4,
+            max_moves: 2,
+            resign_min_ply: 999,
+            ..SelfPlayConfig::default()
+        };
+        let mut rng = rand::thread_rng();
+        let result = play_game(&net, &config, Device::Cpu, &mut rng);
+        assert_eq!(result.termination, TerminationReason::MaxMoves);
+        assert_eq!(result.outcome, 0.0);
+    }
+
+    #[test]
+    fn test_termination_resign() {
+        let (_vs, net) = build_with_config(Device::Cpu, 8, 2);
+        let config = SelfPlayConfig {
+            num_simulations: 4,
+            resign_threshold: 2.0, // always fires
+            resign_min_ply: 0,
+            resign_consecutive: 1,
+            max_moves: 50,
+            ..SelfPlayConfig::default()
+        };
+        let mut rng = rand::thread_rng();
+        let result = play_game(&net, &config, Device::Cpu, &mut rng);
+        assert_eq!(result.termination, TerminationReason::Resign);
+        assert!(result.outcome == 1.0 || result.outcome == -1.0);
     }
 
     // ----- resign logic tests -----

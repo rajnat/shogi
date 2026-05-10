@@ -15,7 +15,7 @@ use tch::{Tensor, nn};
 
 use crate::nn::{Net, checkpoint::build_with_config};
 use crate::replay_buffer::ReplayBuffer;
-use crate::selfplay::{SelfPlayConfig, play_game};
+use crate::selfplay::{SelfPlayConfig, TerminationReason, play_game};
 
 /// One deep copy of every VarStore variable, keyed by name.
 ///
@@ -76,6 +76,39 @@ pub fn build_worker_net(
 }
 
 // ---------------------------------------------------------------------------
+// Aggregate counters
+// ---------------------------------------------------------------------------
+
+/// Snapshot of all self-play counters at a point in time.
+///
+/// Returned by `WorkerPool::counters()` and `WorkerPool::join()` so callers
+/// can read all values in one call without risking inconsistency.
+#[derive(Debug, Default, Clone)]
+pub struct GameCounters {
+    /// Total completed games across all workers.
+    pub games: u64,
+    /// Total training positions (records) pushed to the replay buffer.
+    pub positions: u64,
+    /// Games won by Black (White was checkmated or resigned).
+    pub black_wins: u64,
+    /// Games won by White (Black was checkmated or resigned).
+    pub white_wins: u64,
+    /// Games that ended in a draw.
+    pub draws: u64,
+    /// Games that ended because a player resigned (subset of decisive games).
+    pub resigns: u64,
+    /// Games that ended by hitting `max_moves` (subset of draws).
+    pub max_move_draws: u64,
+}
+
+impl GameCounters {
+    /// Average game length in plies; 0.0 when no games have completed.
+    pub fn avg_game_length(&self) -> f64 {
+        if self.games == 0 { 0.0 } else { self.positions as f64 / self.games as f64 }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Worker pool
 // ---------------------------------------------------------------------------
 
@@ -89,6 +122,11 @@ pub struct WorkerPool {
     games_played: Arc<AtomicU64>,
     /// Total positions (half-moves) generated across all workers since spawn.
     positions_generated: Arc<AtomicU64>,
+    black_wins: Arc<AtomicU64>,
+    white_wins: Arc<AtomicU64>,
+    draws: Arc<AtomicU64>,
+    resigns: Arc<AtomicU64>,
+    max_move_draws: Arc<AtomicU64>,
     /// Stored for potential future use (e.g. rebuilding nets on arch change).
     #[allow(dead_code)]
     channels: i64,
@@ -121,8 +159,13 @@ impl WorkerPool {
         assert!(num_workers > 0, "must spawn at least one worker");
         let shutdown = Arc::new(AtomicBool::new(false));
         let config = Arc::new(config);
-        let games_played = Arc::new(AtomicU64::new(0));
+        let games_played      = Arc::new(AtomicU64::new(0));
         let positions_generated = Arc::new(AtomicU64::new(0));
+        let black_wins        = Arc::new(AtomicU64::new(0));
+        let white_wins        = Arc::new(AtomicU64::new(0));
+        let draws             = Arc::new(AtomicU64::new(0));
+        let resigns           = Arc::new(AtomicU64::new(0));
+        let max_move_draws    = Arc::new(AtomicU64::new(0));
 
         let weight_slots: Vec<WeightSlot> = (0..num_workers)
             .map(|_| Arc::new(Mutex::new(None)))
@@ -137,11 +180,17 @@ impl WorkerPool {
                 let buffer = Arc::clone(&buffer);
                 let config = Arc::clone(&config);
                 let slot = Arc::clone(slot);
-                let games = Arc::clone(&games_played);
-                let positions = Arc::clone(&positions_generated);
+                let games      = Arc::clone(&games_played);
+                let positions  = Arc::clone(&positions_generated);
+                let bw         = Arc::clone(&black_wins);
+                let ww         = Arc::clone(&white_wins);
+                let dr         = Arc::clone(&draws);
+                let rs         = Arc::clone(&resigns);
+                let mmd        = Arc::clone(&max_move_draws);
                 let seed = base_seed.wrapping_add(idx as u64);
                 thread::spawn(move || {
-                    worker_loop(worker_vs, worker_net, config, buffer, shutdown, slot, seed, games, positions)
+                    worker_loop(worker_vs, worker_net, config, buffer, shutdown, slot, seed,
+                                games, positions, bw, ww, dr, rs, mmd)
                 })
             })
             .collect();
@@ -152,20 +201,30 @@ impl WorkerPool {
             weight_slots,
             games_played,
             positions_generated,
+            black_wins,
+            white_wins,
+            draws,
+            resigns,
+            max_move_draws,
             channels,
             blocks,
         }
     }
 
-    /// Returns `(games_played, positions_generated)` since the pool was spawned.
+    /// Snapshot all counters since the pool was spawned.
     ///
     /// Reads are `Relaxed` — values may lag by a few nanoseconds but are always
     /// monotonically non-decreasing and safe to read from any thread.
-    pub fn counters(&self) -> (u64, u64) {
-        (
-            self.games_played.load(Ordering::Relaxed),
-            self.positions_generated.load(Ordering::Relaxed),
-        )
+    pub fn counters(&self) -> GameCounters {
+        GameCounters {
+            games:          self.games_played.load(Ordering::Relaxed),
+            positions:      self.positions_generated.load(Ordering::Relaxed),
+            black_wins:     self.black_wins.load(Ordering::Relaxed),
+            white_wins:     self.white_wins.load(Ordering::Relaxed),
+            draws:          self.draws.load(Ordering::Relaxed),
+            resigns:        self.resigns.load(Ordering::Relaxed),
+            max_move_draws: self.max_move_draws.load(Ordering::Relaxed),
+        }
     }
 
     /// Number of live worker threads.
@@ -192,15 +251,22 @@ impl WorkerPool {
     ///
     /// Because workers check the shutdown flag *after* each game, every thread
     /// is guaranteed to push at least one completed game before returning.
-    pub fn join(self) -> (u64, u64) {
+    pub fn join(self) -> GameCounters {
         self.shutdown.store(true, Ordering::Relaxed);
         for h in self.handles {
             h.join().expect("worker thread panicked");
         }
-        (
-            self.games_played.load(Ordering::Relaxed),
-            self.positions_generated.load(Ordering::Relaxed),
-        )
+        // `self.handles` was moved by the loop; read fields directly instead of
+        // calling `self.counters()` (which would borrow the whole struct).
+        GameCounters {
+            games:          self.games_played.load(Ordering::Relaxed),
+            positions:      self.positions_generated.load(Ordering::Relaxed),
+            black_wins:     self.black_wins.load(Ordering::Relaxed),
+            white_wins:     self.white_wins.load(Ordering::Relaxed),
+            draws:          self.draws.load(Ordering::Relaxed),
+            resigns:        self.resigns.load(Ordering::Relaxed),
+            max_move_draws: self.max_move_draws.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -218,6 +284,11 @@ fn worker_loop(
     seed: u64,
     games_counter: Arc<AtomicU64>,
     positions_counter: Arc<AtomicU64>,
+    black_wins: Arc<AtomicU64>,
+    white_wins: Arc<AtomicU64>,
+    draws: Arc<AtomicU64>,
+    resigns: Arc<AtomicU64>,
+    max_move_draws: Arc<AtomicU64>,
 ) {
     let mut rng = StdRng::seed_from_u64(seed);
     loop {
@@ -229,8 +300,25 @@ fn worker_loop(
         let result = tch::no_grad(|| play_game(&net, &config, tch::Device::Cpu, &mut rng));
         let n_positions = result.records.len() as u64;
         buffer.lock().unwrap().push_game(result.records);
+
         games_counter.fetch_add(1, Ordering::Relaxed);
         positions_counter.fetch_add(n_positions, Ordering::Relaxed);
+
+        // Outcome counters.
+        if result.outcome > 0.0 {
+            black_wins.fetch_add(1, Ordering::Relaxed);
+        } else if result.outcome < 0.0 {
+            white_wins.fetch_add(1, Ordering::Relaxed);
+        } else {
+            draws.fetch_add(1, Ordering::Relaxed);
+        }
+
+        // Termination counters (orthogonal to outcome).
+        match result.termination {
+            TerminationReason::Resign   => { resigns.fetch_add(1, Ordering::Relaxed); }
+            TerminationReason::MaxMoves => { max_move_draws.fetch_add(1, Ordering::Relaxed); }
+            TerminationReason::Checkmate => {}
+        }
 
         // Check shutdown after the game — guarantees at least one game per worker.
         if shutdown.load(Ordering::Relaxed) {
@@ -476,13 +564,33 @@ mod tests {
     }
 
     #[test]
+    fn test_outcome_counters_sum_to_games() {
+        let (master_vs, _) = make_master();
+        let buffer = test_buffer(10_000);
+        let pool = WorkerPool::spawn(2, &master_vs, 8, 2, tiny_config(), Arc::clone(&buffer), 0);
+        let c = pool.join();
+        assert_eq!(
+            c.black_wins + c.white_wins + c.draws, c.games,
+            "black_wins + white_wins + draws must equal total games"
+        );
+        assert!(
+            c.resigns <= c.black_wins + c.white_wins,
+            "resigns must be a subset of decisive games"
+        );
+        assert!(
+            c.max_move_draws <= c.draws,
+            "max_move_draws must be a subset of draws"
+        );
+    }
+
+    #[test]
     fn test_counters_increment_after_one_game() {
         let (master_vs, _) = make_master();
         let buffer = test_buffer(10_000);
         let pool = WorkerPool::spawn(1, &master_vs, 8, 2, tiny_config(), Arc::clone(&buffer), 0);
-        let (games, positions) = pool.join(); // join returns final totals
-        assert!(games >= 1, "expected ≥1 game, got {games}");
-        assert!(positions >= 1, "expected ≥1 position, got {positions}");
+        let c = pool.join();
+        assert!(c.games >= 1, "expected ≥1 game, got {}", c.games);
+        assert!(c.positions >= 1, "expected ≥1 position, got {}", c.positions);
     }
 
     #[test]
@@ -490,8 +598,8 @@ mod tests {
         let (master_vs, _) = make_master();
         let buffer = test_buffer(10_000);
         let pool = WorkerPool::spawn(3, &master_vs, 8, 2, tiny_config(), Arc::clone(&buffer), 0);
-        let (games, _) = pool.join(); // each worker plays at least one game
-        assert!(games >= 3, "expected ≥3 games from 3 workers, got {games}");
+        let c = pool.join();
+        assert!(c.games >= 3, "expected ≥3 games from 3 workers, got {}", c.games);
     }
 
     #[test]

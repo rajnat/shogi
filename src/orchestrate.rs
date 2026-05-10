@@ -15,7 +15,7 @@ use crate::nn::checkpoint::build_with_config;
 use crate::replay_buffer::ReplayBuffer;
 use crate::selfplay::{SelfPlayConfig, play_pit_game};
 use crate::train::Trainer;
-use crate::worker::WorkerPool;
+use crate::worker::{GameCounters, WorkerPool};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -366,14 +366,14 @@ pub fn run_loop<R: Rng>(
                 if let Some(writer) = metrics_writer.as_deref_mut() {
                     let buffer_size = buffer.lock().unwrap().len();
                     let wall_time_sec = started_at.elapsed().as_secs_f64();
-                    let (total_games, total_positions) =
-                        pool.map_or((0, 0), |p| p.counters());
+                    let c = pool.map_or_else(GameCounters::default, |p| p.counters());
                     let dt = (wall_time_sec - last_log_wall_sec).max(1e-9);
-                    let games_per_sec = (total_games - last_log_games) as f64 / dt;
-                    let positions_per_sec = (total_positions - last_log_positions) as f64 / dt;
-                    last_log_wall_sec = wall_time_sec;
-                    last_log_games = total_games;
-                    last_log_positions = total_positions;
+                    let games_per_sec = (c.games - last_log_games) as f64 / dt;
+                    let positions_per_sec = (c.positions - last_log_positions) as f64 / dt;
+                    last_log_wall_sec  = wall_time_sec;
+                    last_log_games     = c.games;
+                    last_log_positions = c.positions;
+                    let avg_game_length = c.avg_game_length();
                     writer
                         .write(&MetricEvent::Train(TrainEvent {
                             step: metrics.step,
@@ -384,10 +384,16 @@ pub fn run_loop<R: Rng>(
                             buffer_size,
                             checkpoint_every: config.checkpoint_every,
                             batch_size: trainer.batch_size(),
-                            selfplay_games: total_games,
-                            selfplay_positions: total_positions,
+                            selfplay_games:    c.games,
+                            selfplay_positions: c.positions,
                             games_per_sec,
                             positions_per_sec,
+                            selfplay_black_wins:   c.black_wins,
+                            selfplay_white_wins:   c.white_wins,
+                            selfplay_draws:        c.draws,
+                            selfplay_resigns:      c.resigns,
+                            selfplay_max_move_draws: c.max_move_draws,
+                            avg_game_length,
                         }))
                         .expect("failed to write training metrics JSONL");
                 }

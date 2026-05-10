@@ -30,6 +30,14 @@ pub struct TrainEvent {
     // Per-second rates over the window since the previous log event.
     pub games_per_sec: f64,
     pub positions_per_sec: f64,
+    // Outcome distribution (cumulative since run start).
+    pub selfplay_black_wins: u64,
+    pub selfplay_white_wins: u64,
+    pub selfplay_draws: u64,
+    pub selfplay_resigns: u64,
+    pub selfplay_max_move_draws: u64,
+    /// Mean game length in plies (positions / games).
+    pub avg_game_length: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
