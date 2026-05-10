@@ -384,6 +384,7 @@ fn main() {
         } => {
             use rand::rngs::StdRng;
             use rand::SeedableRng;
+            use shogi_core::metrics::JsonlWriter;
             use shogi_core::nn;
             use shogi_core::orchestrate::{run_loop, OrchestrationConfig};
             use shogi_core::replay_buffer::ReplayBuffer;
@@ -396,7 +397,11 @@ fn main() {
             let (metrics_jsonl_path, eval_jsonl_path) =
                 resolve_run_output_paths(&run_dir, metrics_jsonl, eval_jsonl);
             std::fs::create_dir_all(&run_dir).expect("failed to create run dir");
-            let _ = (&metrics_jsonl_path, &eval_jsonl_path);
+            let mut metrics_writer = Some(
+                JsonlWriter::new(&metrics_jsonl_path)
+                    .expect("failed to create metrics JSONL writer"),
+            );
+            let _ = &eval_jsonl_path;
 
             let train_config = TrainConfig {
                 batch_size,
@@ -467,6 +472,7 @@ fn main() {
                 &config,
                 &mut rng,
                 shutdown,
+                metrics_writer.as_mut(),
             );
 
             if let Some(p) = pool {

@@ -14,6 +14,18 @@ pub struct TrainMetricEvent {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct TrainEvent {
+    pub step: u64,
+    pub wall_time_sec: f64,
+    pub total_loss: f64,
+    pub policy_loss: f64,
+    pub value_loss: f64,
+    pub buffer_size: usize,
+    pub checkpoint_every: u64,
+    pub batch_size: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct CheckpointEvent {
     pub step: u64,
     pub path: String,
@@ -29,6 +41,8 @@ pub struct EvalEvent {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MetricEvent {
+    #[serde(rename = "train")]
+    Train(TrainEvent),
     TrainMetric(TrainMetricEvent),
     Checkpoint(CheckpointEvent),
     Eval(EvalEvent),

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use rand::Rng;
 use tch::Device;
 
+use crate::metrics::{JsonlWriter, MetricEvent, TrainEvent};
 use crate::nn::checkpoint::build_with_config;
 use crate::replay_buffer::ReplayBuffer;
 use crate::selfplay::{SelfPlayConfig, play_pit_game};
@@ -256,9 +257,11 @@ pub fn run_loop<R: Rng>(
     config: &OrchestrationConfig,
     rng: &mut R,
     shutdown: Arc<AtomicBool>,
+    mut metrics_writer: Option<&mut JsonlWriter>,
 ) {
     wait_for_buffer(&buffer, trainer.min_buffer_size(), config.fill_poll_ms);
 
+    let started_at = Instant::now();
     let mut prev_ckpt: Option<PathBuf> = None;
 
     loop {
@@ -269,7 +272,24 @@ pub fn run_loop<R: Rng>(
             if config.total_steps > 0 && trainer.step >= config.total_steps {
                 return;
             }
-            trainer.train_step(&buffer, rng);
+            let metrics = trainer.train_step(&buffer, rng);
+            if metrics.step == 1 || trainer.should_log(metrics.step) {
+                if let Some(writer) = metrics_writer.as_deref_mut() {
+                    let buffer_size = buffer.lock().unwrap().len();
+                    writer
+                        .write(&MetricEvent::Train(TrainEvent {
+                            step: metrics.step,
+                            wall_time_sec: started_at.elapsed().as_secs_f64(),
+                            total_loss: metrics.total_loss,
+                            policy_loss: metrics.policy_loss,
+                            value_loss: metrics.value_loss,
+                            buffer_size,
+                            checkpoint_every: config.checkpoint_every,
+                            batch_size: trainer.batch_size(),
+                        }))
+                        .expect("failed to write training metrics JSONL");
+                }
+            }
         }
 
         if let Some(p) = pool {
@@ -386,6 +406,7 @@ mod tests {
             &fast_config(7, 3),
             &mut rng,
             no_shutdown(),
+            None,
         );
         assert_eq!(t.step, 7, "expected 7 steps, got {}", t.step);
     }
@@ -406,6 +427,7 @@ mod tests {
             &fast_config(100, 10),
             &mut rng,
             Arc::clone(&shutdown),
+            None,
         );
         assert_eq!(t.step, 0, "shutdown-before-start should run 0 steps");
     }
@@ -424,6 +446,7 @@ mod tests {
             &fast_config(10, 5),
             &mut rng,
             no_shutdown(),
+            None,
         );
         assert_eq!(t.step, 10);
     }
@@ -442,8 +465,58 @@ mod tests {
             &fast_config(7, 5),
             &mut rng,
             no_shutdown(),
+            None,
         );
         assert_eq!(t.step, 7);
+    }
+
+    #[test]
+    fn test_run_loop_writes_train_metrics_jsonl_at_first_step_and_log_interval() {
+        let mut t = Trainer::new(
+            Device::Cpu,
+            8,
+            2,
+            TrainConfig {
+                batch_size: 4,
+                min_buffer_size: 4,
+                log_every: 2,
+                ..TrainConfig::default()
+            },
+        );
+        let buf = filled_buffer(t.min_buffer_size());
+        let mut rng = StdRng::seed_from_u64(0);
+        let dir = tempfile::tempdir().unwrap();
+        let metrics_path = dir.path().join("metrics.jsonl");
+        let mut metrics_writer = crate::metrics::JsonlWriter::new(&metrics_path).unwrap();
+
+        run_loop(
+            &mut t,
+            buf,
+            None,
+            &fast_config(3, 1),
+            &mut rng,
+            no_shutdown(),
+            Some(&mut metrics_writer),
+        );
+
+        let contents = std::fs::read_to_string(metrics_path).unwrap();
+        let lines: Vec<_> = contents.lines().collect();
+        assert_eq!(lines.len(), 2, "expected events at steps 1 and 2");
+
+        let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(first["type"], "train");
+        assert_eq!(first["step"], 1);
+        assert_eq!(first["buffer_size"], 4);
+        assert!(first["wall_time_sec"].as_f64().unwrap() >= 0.0);
+        assert!(first["total_loss"].as_f64().unwrap().is_finite());
+        assert!(first["policy_loss"].as_f64().unwrap().is_finite());
+        assert!(first["value_loss"].as_f64().unwrap().is_finite());
+
+        let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(second["type"], "train");
+        assert_eq!(second["step"], 2);
+        assert_eq!(second["batch_size"], 4);
+        assert_eq!(second["checkpoint_every"], 0);
     }
 
     #[test]
@@ -459,7 +532,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
             sd2.store(true, Ordering::Relaxed);
         });
-        run_loop(&mut t, buf, None, &fast_config(0, 1), &mut rng, shutdown);
+        run_loop(&mut t, buf, None, &fast_config(0, 1), &mut rng, shutdown, None);
         assert!(
             t.step > 0,
             "should have run at least one step before shutdown"
@@ -571,7 +644,7 @@ mod tests {
             checkpoint_dir: dir.path().to_str().unwrap().to_string(),
             pit_games: 0, // disabled: pit would be too slow for a unit test
         };
-        run_loop(&mut t, buf, None, &cfg, &mut rng, no_shutdown());
+        run_loop(&mut t, buf, None, &cfg, &mut rng, no_shutdown(), None);
         assert_eq!(t.step, 10);
         assert!(dir.path().join("step_00000005.ot").exists(), "checkpoint at step 5");
         assert!(dir.path().join("step_00000010.ot").exists(), "checkpoint at step 10");
