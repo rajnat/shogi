@@ -535,15 +535,25 @@ def _tee(src: TextIO, *dests: TextIO) -> None:
 
 
 def _env_with_libtorch() -> dict[str, str]:
-    """Return os.environ extended with DYLD_LIBRARY_PATH for libtorch on macOS."""
+    """Return os.environ extended with LIBTORCH and DYLD_LIBRARY_PATH.
+
+    torch-sys build script requires LIBTORCH to point at the install root.
+    We probe a fixed default (~/libtorch) when the var isn't already set.
+    """
     import os
     env = os.environ.copy()
+
+    # Resolve the libtorch root: prefer the env var, fall back to ~/libtorch.
+    libtorch_root = os.environ.get("LIBTORCH") or os.path.expanduser("~/libtorch")
+    if Path(libtorch_root).is_dir():
+        env["LIBTORCH"] = libtorch_root
+        env.setdefault("LIBTORCH_BYPASS_VERSION_CHECK", "1")
+
+    # Build DYLD_LIBRARY_PATH so the runtime linker can find libtorch *.dylib.
     candidates = [
-        os.path.expanduser("~/libtorch/lib"),
+        str(Path(libtorch_root) / "lib"),
         os.path.expanduser("~/.local/lib"),
     ]
-    if libtorch := os.environ.get("LIBTORCH"):
-        candidates.insert(0, str(Path(libtorch) / "lib"))
     extra = ":".join(c for c in candidates if Path(c).is_dir())
     if extra:
         existing = env.get("DYLD_LIBRARY_PATH", "")
