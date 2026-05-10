@@ -1,0 +1,32 @@
+# W&B Bayesian sweep over MCTS exploration hyperparameters.
+#
+# Optimises eval/anchor/elo_delta — the ELO gain over the fixed anchor
+# checkpoint, logged every checkpoint_every steps.
+#
+# Usage (from project root):
+#   uv run --project experiments python experiments/run_sweep.py \
+#       --base-config experiments/configs/baseline_fast.yaml \
+#       --sweep-config experiments/configs/sweep_exploration.yaml \
+#       --count 20
+
+method: bayes
+metric:
+  name: eval/anchor/elo_delta
+  goal: maximize
+
+parameters:
+  c_puct:
+    distribution: uniform
+    min: 0.5
+    max: 3.0
+
+  dirichlet_alpha:
+    # Controls concentration of Dirichlet noise added at the root.
+    # Lower = more concentrated (less exploration diversity).
+    values: [0.05, 0.10, 0.15, 0.20, 0.30]
+
+  dirichlet_epsilon:
+    # Fraction of root prior replaced by Dirichlet noise.
+    distribution: uniform
+    min: 0.10
+    max: 0.45
