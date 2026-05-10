@@ -38,6 +38,10 @@ pub struct TrainEvent {
     pub selfplay_max_move_draws: u64,
     /// Mean game length in plies (positions / games).
     pub avg_game_length: f64,
+    /// Mean Shannon entropy (nats) of the MCTS visit distribution, averaged across all games.
+    pub avg_visit_entropy: f64,
+    /// Mean Shannon entropy (nats) of the network's softmax policy at the root, averaged across all games.
+    pub avg_policy_entropy: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]

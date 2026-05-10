@@ -17,6 +17,19 @@ use crate::nn::{Net, checkpoint::build_with_config};
 use crate::replay_buffer::ReplayBuffer;
 use crate::selfplay::{SelfPlayConfig, TerminationReason, play_game};
 
+// ---------------------------------------------------------------------------
+// Atomic f64 accumulator (bit-cast through u64)
+// ---------------------------------------------------------------------------
+
+/// Atomically add `val` to the f64 stored in `atom`.
+///
+/// Uses a CAS loop; contention is negligible (one call per game per worker).
+fn atomic_f64_add(atom: &AtomicU64, val: f64) {
+    let _ = atom.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
+        Some((f64::from_bits(bits) + val).to_bits())
+    });
+}
+
 /// One deep copy of every VarStore variable, keyed by name.
 ///
 /// `Tensor` is `Send` but not `Sync` in tch-0.24, so each worker slot holds
@@ -99,12 +112,26 @@ pub struct GameCounters {
     pub resigns: u64,
     /// Games that ended by hitting `max_moves` (subset of draws).
     pub max_move_draws: u64,
+    /// Sum of per-game average visit-distribution entropies (nats).
+    pub visit_entropy_sum: f64,
+    /// Sum of per-game average root-policy entropies (nats).
+    pub policy_entropy_sum: f64,
 }
 
 impl GameCounters {
     /// Average game length in plies; 0.0 when no games have completed.
     pub fn avg_game_length(&self) -> f64 {
         if self.games == 0 { 0.0 } else { self.positions as f64 / self.games as f64 }
+    }
+
+    /// Average visit-distribution entropy across all completed games (nats).
+    pub fn avg_visit_entropy(&self) -> f64 {
+        if self.games == 0 { 0.0 } else { self.visit_entropy_sum / self.games as f64 }
+    }
+
+    /// Average root-policy entropy across all completed games (nats).
+    pub fn avg_policy_entropy(&self) -> f64 {
+        if self.games == 0 { 0.0 } else { self.policy_entropy_sum / self.games as f64 }
     }
 }
 
@@ -127,6 +154,10 @@ pub struct WorkerPool {
     draws: Arc<AtomicU64>,
     resigns: Arc<AtomicU64>,
     max_move_draws: Arc<AtomicU64>,
+    /// Per-game average visit entropy, accumulated as f64 bits in a u64.
+    visit_entropy_sum: Arc<AtomicU64>,
+    /// Per-game average policy entropy, accumulated as f64 bits in a u64.
+    policy_entropy_sum: Arc<AtomicU64>,
     /// Stored for potential future use (e.g. rebuilding nets on arch change).
     #[allow(dead_code)]
     channels: i64,
@@ -159,13 +190,16 @@ impl WorkerPool {
         assert!(num_workers > 0, "must spawn at least one worker");
         let shutdown = Arc::new(AtomicBool::new(false));
         let config = Arc::new(config);
-        let games_played      = Arc::new(AtomicU64::new(0));
+        let games_played        = Arc::new(AtomicU64::new(0));
         let positions_generated = Arc::new(AtomicU64::new(0));
-        let black_wins        = Arc::new(AtomicU64::new(0));
-        let white_wins        = Arc::new(AtomicU64::new(0));
-        let draws             = Arc::new(AtomicU64::new(0));
-        let resigns           = Arc::new(AtomicU64::new(0));
-        let max_move_draws    = Arc::new(AtomicU64::new(0));
+        let black_wins          = Arc::new(AtomicU64::new(0));
+        let white_wins          = Arc::new(AtomicU64::new(0));
+        let draws               = Arc::new(AtomicU64::new(0));
+        let resigns             = Arc::new(AtomicU64::new(0));
+        let max_move_draws      = Arc::new(AtomicU64::new(0));
+        // 0u64 == 0.0f64.to_bits() so default-zero initialization is correct.
+        let visit_entropy_sum   = Arc::new(AtomicU64::new(0));
+        let policy_entropy_sum  = Arc::new(AtomicU64::new(0));
 
         let weight_slots: Vec<WeightSlot> = (0..num_workers)
             .map(|_| Arc::new(Mutex::new(None)))
@@ -187,10 +221,12 @@ impl WorkerPool {
                 let dr         = Arc::clone(&draws);
                 let rs         = Arc::clone(&resigns);
                 let mmd        = Arc::clone(&max_move_draws);
+                let ves        = Arc::clone(&visit_entropy_sum);
+                let pes        = Arc::clone(&policy_entropy_sum);
                 let seed = base_seed.wrapping_add(idx as u64);
                 thread::spawn(move || {
                     worker_loop(worker_vs, worker_net, config, buffer, shutdown, slot, seed,
-                                games, positions, bw, ww, dr, rs, mmd)
+                                games, positions, bw, ww, dr, rs, mmd, ves, pes)
                 })
             })
             .collect();
@@ -206,6 +242,8 @@ impl WorkerPool {
             draws,
             resigns,
             max_move_draws,
+            visit_entropy_sum,
+            policy_entropy_sum,
             channels,
             blocks,
         }
@@ -217,13 +255,15 @@ impl WorkerPool {
     /// monotonically non-decreasing and safe to read from any thread.
     pub fn counters(&self) -> GameCounters {
         GameCounters {
-            games:          self.games_played.load(Ordering::Relaxed),
-            positions:      self.positions_generated.load(Ordering::Relaxed),
-            black_wins:     self.black_wins.load(Ordering::Relaxed),
-            white_wins:     self.white_wins.load(Ordering::Relaxed),
-            draws:          self.draws.load(Ordering::Relaxed),
-            resigns:        self.resigns.load(Ordering::Relaxed),
-            max_move_draws: self.max_move_draws.load(Ordering::Relaxed),
+            games:              self.games_played.load(Ordering::Relaxed),
+            positions:          self.positions_generated.load(Ordering::Relaxed),
+            black_wins:         self.black_wins.load(Ordering::Relaxed),
+            white_wins:         self.white_wins.load(Ordering::Relaxed),
+            draws:              self.draws.load(Ordering::Relaxed),
+            resigns:            self.resigns.load(Ordering::Relaxed),
+            max_move_draws:     self.max_move_draws.load(Ordering::Relaxed),
+            visit_entropy_sum:  f64::from_bits(self.visit_entropy_sum.load(Ordering::Relaxed)),
+            policy_entropy_sum: f64::from_bits(self.policy_entropy_sum.load(Ordering::Relaxed)),
         }
     }
 
@@ -259,13 +299,15 @@ impl WorkerPool {
         // `self.handles` was moved by the loop; read fields directly instead of
         // calling `self.counters()` (which would borrow the whole struct).
         GameCounters {
-            games:          self.games_played.load(Ordering::Relaxed),
-            positions:      self.positions_generated.load(Ordering::Relaxed),
-            black_wins:     self.black_wins.load(Ordering::Relaxed),
-            white_wins:     self.white_wins.load(Ordering::Relaxed),
-            draws:          self.draws.load(Ordering::Relaxed),
-            resigns:        self.resigns.load(Ordering::Relaxed),
-            max_move_draws: self.max_move_draws.load(Ordering::Relaxed),
+            games:              self.games_played.load(Ordering::Relaxed),
+            positions:          self.positions_generated.load(Ordering::Relaxed),
+            black_wins:         self.black_wins.load(Ordering::Relaxed),
+            white_wins:         self.white_wins.load(Ordering::Relaxed),
+            draws:              self.draws.load(Ordering::Relaxed),
+            resigns:            self.resigns.load(Ordering::Relaxed),
+            max_move_draws:     self.max_move_draws.load(Ordering::Relaxed),
+            visit_entropy_sum:  f64::from_bits(self.visit_entropy_sum.load(Ordering::Relaxed)),
+            policy_entropy_sum: f64::from_bits(self.policy_entropy_sum.load(Ordering::Relaxed)),
         }
     }
 }
@@ -289,6 +331,8 @@ fn worker_loop(
     draws: Arc<AtomicU64>,
     resigns: Arc<AtomicU64>,
     max_move_draws: Arc<AtomicU64>,
+    visit_entropy_sum: Arc<AtomicU64>,
+    policy_entropy_sum: Arc<AtomicU64>,
 ) {
     let mut rng = StdRng::seed_from_u64(seed);
     loop {
@@ -303,6 +347,10 @@ fn worker_loop(
 
         games_counter.fetch_add(1, Ordering::Relaxed);
         positions_counter.fetch_add(n_positions, Ordering::Relaxed);
+
+        // Entropy accumulators.
+        atomic_f64_add(&visit_entropy_sum, result.avg_visit_entropy as f64);
+        atomic_f64_add(&policy_entropy_sum, result.avg_policy_entropy as f64);
 
         // Outcome counters.
         if result.outcome > 0.0 {

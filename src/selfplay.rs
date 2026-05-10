@@ -19,7 +19,7 @@
 /// Once `config.resign_min_ply` half-moves have been played, if the network's
 /// value estimate at the root stays below `config.resign_threshold` for
 /// `config.resign_consecutive` consecutive plies, the side to move resigns.
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use rand::Rng;
 use tch::{Device, Tensor};
@@ -119,11 +119,36 @@ pub struct SelfPlayResult {
     pub termination: TerminationReason,
     /// Number of half-moves (plies) played; equal to `records.len()`.
     pub plies: usize,
+    /// Mean Shannon entropy (nats) of the MCTS visit distribution across all plies.
+    pub avg_visit_entropy: f32,
+    /// Mean Shannon entropy (nats) of the network's softmax policy at the root across all plies.
+    pub avg_policy_entropy: f32,
 }
 
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Shannon entropy (nats) of a probability distribution.
+///
+/// Zero-probability entries are skipped to avoid log(0).
+pub fn entropy(dist: &[f32]) -> f32 {
+    dist.iter().filter(|&&p| p > 0.0).map(|&p| -p * p.ln()).sum()
+}
+
+/// Shannon entropy (nats) of a softmax applied to raw logits.
+///
+/// Subtracts the max for numerical stability before exponentiating.
+fn softmax_entropy(logits: &[f32]) -> f32 {
+    if logits.is_empty() {
+        return 0.0;
+    }
+    let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f32> = logits.iter().map(|&x| (x - max).exp()).collect();
+    let sum: f32 = exps.iter().sum();
+    let probs: Vec<f32> = exps.iter().map(|&e| e / sum).collect();
+    entropy(&probs)
+}
 
 /// Extract a visit-count distribution over `NUM_ACTIONS` from the MCTS root.
 ///
@@ -187,6 +212,10 @@ pub fn play_game(
     let mut resign_counter = 0u32;
     let mut resigned = false;
 
+    // Per-ply entropy accumulators.
+    let mut visit_entropies: Vec<f32> = Vec::new();
+    let mut policy_entropies: Vec<f32> = Vec::new();
+
     for ply in 0..config.max_moves {
         // Check for terminal before searching.
         let mut legal = Vec::new();
@@ -209,9 +238,11 @@ pub fn play_game(
 
         // Use a counter to distinguish the root eval (call 0) from leaf evals
         // (calls 1…N) inside mcts_search_with_evaluator.  This lets us capture
-        // the network's value estimate at the root without a second forward pass.
+        // the network's value estimate and policy at the root without a second
+        // forward pass.
         let call_count = Cell::new(0u32);
         let root_value = Cell::new(0.0f32);
+        let root_policy_logits: RefCell<Vec<f32>> = RefCell::new(Vec::new());
 
         let mv = tch::no_grad(|| {
             mcts_search_with_evaluator(
@@ -224,6 +255,7 @@ pub fn play_game(
                     let result = eval_with_net(net, device, b);
                     if call_count.get() == 0 {
                         root_value.set(result.value);
+                        *root_policy_logits.borrow_mut() = result.policy_logits.clone();
                     }
                     call_count.set(call_count.get() + 1);
                     result
@@ -237,6 +269,10 @@ pub fn play_game(
 
         // Policy target: normalised visit counts from the root (index 0).
         let policy = visit_distribution(&arena, 0);
+
+        // Entropy measurements for this ply.
+        visit_entropies.push(entropy(&policy));
+        policy_entropies.push(softmax_entropy(&root_policy_logits.borrow()));
 
         // Record before applying the move.
         raw.push((encode(&board), policy, board.side_to_move));
@@ -293,11 +329,23 @@ pub fn play_game(
         .collect();
 
     let plies = records.len();
+    let avg_visit_entropy = if visit_entropies.is_empty() {
+        0.0
+    } else {
+        visit_entropies.iter().sum::<f32>() / visit_entropies.len() as f32
+    };
+    let avg_policy_entropy = if policy_entropies.is_empty() {
+        0.0
+    } else {
+        policy_entropies.iter().sum::<f32>() / policy_entropies.len() as f32
+    };
     SelfPlayResult {
         records,
         outcome: outcome_for_black,
         termination,
         plies,
+        avg_visit_entropy,
+        avg_policy_entropy,
     }
 }
 
@@ -425,6 +473,41 @@ mod tests {
             max_moves: 20,
             ..SelfPlayConfig::default()
         }
+    }
+
+    // ----- entropy helper -----
+
+    #[test]
+    fn test_entropy_uniform_distribution() {
+        // Uniform over N outcomes → H = ln(N).
+        let n = 4usize;
+        let uniform = vec![1.0f32 / n as f32; n];
+        let h = entropy(&uniform);
+        let expected = (n as f32).ln();
+        assert!((h - expected).abs() < 1e-5, "uniform entropy: got {h}, expected {expected}");
+    }
+
+    #[test]
+    fn test_entropy_deterministic_distribution() {
+        // One outcome with probability 1 → H = 0.
+        let mut dist = vec![0.0f32; 8];
+        dist[3] = 1.0;
+        let h = entropy(&dist);
+        assert!(h.abs() < 1e-6, "deterministic entropy must be 0, got {h}");
+    }
+
+    #[test]
+    fn test_entropy_two_outcomes() {
+        // p=0.5, q=0.5 → H = ln(2) ≈ 0.6931.
+        let dist = vec![0.5f32, 0.5];
+        let h = entropy(&dist);
+        assert!((h - 2.0f32.ln()).abs() < 1e-5, "binary entropy: got {h}");
+    }
+
+    #[test]
+    fn test_entropy_is_non_negative() {
+        let dist = vec![0.1f32, 0.3, 0.6];
+        assert!(entropy(&dist) >= 0.0);
     }
 
     // ----- visit_distribution -----

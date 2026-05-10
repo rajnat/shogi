@@ -374,6 +374,8 @@ pub fn run_loop<R: Rng>(
                     last_log_games     = c.games;
                     last_log_positions = c.positions;
                     let avg_game_length = c.avg_game_length();
+                    let avg_visit_entropy = c.avg_visit_entropy();
+                    let avg_policy_entropy = c.avg_policy_entropy();
                     writer
                         .write(&MetricEvent::Train(TrainEvent {
                             step: metrics.step,
@@ -394,6 +396,8 @@ pub fn run_loop<R: Rng>(
                             selfplay_resigns:      c.resigns,
                             selfplay_max_move_draws: c.max_move_draws,
                             avg_game_length,
+                            avg_visit_entropy,
+                            avg_policy_entropy,
                         }))
                         .expect("failed to write training metrics JSONL");
                 }
