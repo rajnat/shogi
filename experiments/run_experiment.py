@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import signal
 import subprocess
 import sys
 import threading
@@ -413,10 +414,45 @@ def _env_with_libtorch() -> dict[str, str]:
     return env
 
 
-def launch(cmd: list[str], run_dir: Path, wb_run=None) -> int:
+def graceful_stop(
+    proc: subprocess.Popen,
+    sigint_wait: float = 10.0,
+    sigterm_wait: float = 5.0,
+) -> None:
+    """Stop *proc* gracefully, escalating SIGINT → SIGTERM → SIGKILL.
+
+    The Rust training loop checkpoints and flushes logs on SIGINT, so give it
+    the most time.  SIGTERM and SIGKILL are fallbacks for a hung process.
+    """
+    if proc.poll() is not None:
+        return
+    proc.send_signal(signal.SIGINT)
+    try:
+        proc.wait(timeout=sigint_wait)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    proc.terminate()  # SIGTERM
+    try:
+        proc.wait(timeout=sigterm_wait)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    proc.kill()       # SIGKILL — last resort
+    proc.wait()
+
+
+def launch(
+    cmd: list[str],
+    run_dir: Path,
+    wb_run=None,
+    max_runtime_sec: float | None = None,
+) -> int:
     """Run *cmd*, tee-ing stdout/stderr to logs while tailing JSONL metrics.
 
     When *wb_run* is provided, each parsed JSONL event is also logged to W&B.
+    When *max_runtime_sec* is set, training is stopped gracefully after that
+    many seconds (useful for plateau detection or time-boxed experiments).
     """
     stdout_path  = run_dir / "stdout.log"
     stderr_path  = run_dir / "stderr.log"
@@ -466,6 +502,17 @@ def launch(cmd: list[str], run_dir: Path, wb_run=None) -> int:
             stop.set()
             return 127
 
+        if max_runtime_sec is not None:
+            def _watchdog() -> None:
+                time.sleep(max_runtime_sec)
+                if proc.poll() is None:
+                    _locked_print(
+                        f"\n[timeout] {max_runtime_sec:.0f}s elapsed"
+                        " — stopping training gracefully"
+                    )
+                    graceful_stop(proc)
+            threading.Thread(target=_watchdog, daemon=True, name="watchdog").start()
+
         t_out = threading.Thread(
             target=_tee, args=(proc.stdout, sys.stdout, fout), daemon=True
         )
@@ -479,7 +526,8 @@ def launch(cmd: list[str], run_dir: Path, wb_run=None) -> int:
             t_out.join()
             t_err.join()
         except KeyboardInterrupt:
-            proc.terminate()
+            _locked_print("\n[interrupted] stopping training gracefully…")
+            graceful_stop(proc)
             t_out.join()
             t_err.join()
 
@@ -506,6 +554,9 @@ def main(argv: list[str] | None = None) -> None:
                         help="Experiment config file")
     parser.add_argument("--dry-run", action="store_true",
                         help="Write files but do not launch training")
+    parser.add_argument("--max-runtime-sec", type=float, default=None,
+                        metavar="SEC",
+                        help="Stop training gracefully after this many seconds")
     args = parser.parse_args(argv)
 
     cfg: dict = yaml.safe_load(args.config.read_text())
@@ -539,7 +590,7 @@ def main(argv: list[str] | None = None) -> None:
     wb_run = init_wandb(cfg, run_dir)
 
     print("\nLaunching training…\n")
-    rc = launch(cmd, run_dir, wb_run=wb_run)
+    rc = launch(cmd, run_dir, wb_run=wb_run, max_runtime_sec=args.max_runtime_sec)
 
     if wb_run is not None:
         upload_run_artifacts(run_dir, wb_run, cfg)
