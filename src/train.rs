@@ -38,6 +38,14 @@ impl Default for TrainConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct TrainStepMetrics {
+    pub step: u64,
+    pub total_loss: f64,
+    pub policy_loss: f64,
+    pub value_loss: f64,
+}
+
 // ---------------------------------------------------------------------------
 // Trainer
 // ---------------------------------------------------------------------------
@@ -198,14 +206,13 @@ impl Trainer {
     ///
     /// Prints a loss line to stdout when `step % log_every == 0`.
     ///
-    /// Returns `(total, policy, value)` loss values as `f64` scalars so the
-    /// caller can log them without holding a live tensor.  `self.step` is
-    /// incremented after each call.
+    /// Returns loss values as `f64` scalars so the caller can log them without
+    /// holding a live tensor.  `self.step` is incremented after each call.
     pub fn train_step<R: Rng>(
         &mut self,
         buffer: &Arc<Mutex<ReplayBuffer>>,
         rng: &mut R,
-    ) -> (f64, f64, f64) {
+    ) -> TrainStepMetrics {
         let (boards, policy_targets, value_targets) = self.sample_batch(buffer, rng);
         let (policy_logits, pred_values) = self.forward(&boards);
         let (total, lp, lv) = self.total_loss(
@@ -216,18 +223,24 @@ impl Trainer {
         );
         self.opt.backward_step(&total);
         self.step += 1;
-        let losses = (
-            total.double_value(&[]),
-            lp.double_value(&[]),
-            lv.double_value(&[]),
-        );
+        let metrics = TrainStepMetrics {
+            step: self.step,
+            total_loss: total.double_value(&[]),
+            policy_loss: lp.double_value(&[]),
+            value_loss: lv.double_value(&[]),
+        };
         if self.step % self.config.log_every == 0 {
             println!(
                 "{}",
-                Self::format_log_line(self.step, losses.0, losses.1, losses.2)
+                Self::format_log_line(
+                    metrics.step,
+                    metrics.total_loss,
+                    metrics.policy_loss,
+                    metrics.value_loss,
+                )
             );
         }
-        losses
+        metrics
     }
 
     /// Format a single log line for a training step.
@@ -672,14 +685,27 @@ mod tests {
     }
 
     #[test]
-    fn test_train_step_returns_finite_losses() {
+    fn test_train_step_returns_structured_finite_metrics() {
         let mut t = trainer_mut();
         let buf = filled_buffer(t.min_buffer_size());
         let mut rng = StdRng::seed_from_u64(0);
-        let (total, lp, lv) = t.train_step(&buf, &mut rng);
-        assert!(total.is_finite(), "total loss is not finite: {total}");
-        assert!(lp.is_finite(), "policy loss is not finite: {lp}");
-        assert!(lv.is_finite(), "value loss is not finite: {lv}");
+        let metrics = t.train_step(&buf, &mut rng);
+        assert_eq!(metrics.step, 1);
+        assert!(
+            metrics.total_loss.is_finite(),
+            "total loss is not finite: {}",
+            metrics.total_loss
+        );
+        assert!(
+            metrics.policy_loss.is_finite(),
+            "policy loss is not finite: {}",
+            metrics.policy_loss
+        );
+        assert!(
+            metrics.value_loss.is_finite(),
+            "value loss is not finite: {}",
+            metrics.value_loss
+        );
     }
 
     #[test]
@@ -699,10 +725,22 @@ mod tests {
         let mut t = trainer_mut();
         let buf = filled_buffer(t.min_buffer_size());
         let mut rng = StdRng::seed_from_u64(0);
-        let (total, lp, lv) = t.train_step(&buf, &mut rng);
-        assert!(total >= 0.0, "total loss < 0: {total}");
-        assert!(lp >= 0.0, "policy loss < 0: {lp}");
-        assert!(lv >= 0.0, "value loss < 0: {lv}");
+        let metrics = t.train_step(&buf, &mut rng);
+        assert!(
+            metrics.total_loss >= 0.0,
+            "total loss < 0: {}",
+            metrics.total_loss
+        );
+        assert!(
+            metrics.policy_loss >= 0.0,
+            "policy loss < 0: {}",
+            metrics.policy_loss
+        );
+        assert!(
+            metrics.value_loss >= 0.0,
+            "value loss < 0: {}",
+            metrics.value_loss
+        );
     }
 
     #[test]
@@ -725,11 +763,11 @@ mod tests {
         };
         let mut rng = StdRng::seed_from_u64(42);
 
-        let (first_loss, _, _) = t.train_step(&buf, &mut rng);
+        let first_loss = t.train_step(&buf, &mut rng).total_loss;
         for _ in 1..199 {
             t.train_step(&buf, &mut rng);
         }
-        let (last_loss, _, _) = t.train_step(&buf, &mut rng);
+        let last_loss = t.train_step(&buf, &mut rng).total_loss;
 
         assert!(
             last_loss < first_loss,
