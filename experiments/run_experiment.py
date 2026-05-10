@@ -217,23 +217,42 @@ class PlateauDetector:
         self.min_step = min_step
         self._history: list[tuple[int, float]] = []  # (step, elo_delta)
 
-    def check(self, event: dict) -> bool:
-        """Return True if a plateau is detected (caller should stop training)."""
+    def check(self, event: dict) -> "dict | None":
+        """Return a plateau-event dict when a plateau is detected, else None.
+
+        The returned dict contains all fields needed for plateau.json and W&B.
+        """
         if event.get("opponent_kind") != self.opponent_kind:
-            return False
+            return None
         step = event.get("step", 0)
         elo  = event.get("elo_delta", 0.0)
         self._history.append((step, elo))
 
         if step < self.min_step:
-            return False
+            return None
         if len(self._history) < self.patience_evals + 1:
-            return False
+            return None
 
         split = len(self._history) - self.patience_evals
         previous_best = max(e for _, e in self._history[:split])
         recent_best   = max(e for _, e in self._history[split:])
-        return (recent_best - previous_best) < self.min_elo_gain
+        gain = recent_best - previous_best
+        if gain >= self.min_elo_gain:
+            return None
+
+        return {
+            "triggered":     True,
+            "step":          step,
+            "opponent_kind": self.opponent_kind,
+            "patience_evals": self.patience_evals,
+            "min_elo_gain":  self.min_elo_gain,
+            "recent_best":   recent_best,
+            "previous_best": previous_best,
+            "reason": (
+                f"ELO gain {gain:+.1f} over last {self.patience_evals} evals"
+                f" is below threshold {self.min_elo_gain:+.0f}"
+            ),
+        }
 
 
 def _make_plateau_detector(cfg: dict) -> "PlateauDetector | None":
@@ -296,6 +315,30 @@ def _wb_log_eval(event: dict, run) -> None:
         _locked_print(f"  [warn] W&B eval log failed ({kind}): {exc}")
 
 
+def _write_plateau_event(run_dir: Path, plateau_event: dict) -> None:
+    path = run_dir / "plateau.json"
+    path.write_text(json.dumps(plateau_event, indent=2) + "\n")
+    _locked_print(f"  \033[33m[plateau]\033[0m  wrote {path}")
+
+
+def _wb_log_plateau(plateau_event: dict, run) -> None:
+    step = plateau_event["step"]
+    try:
+        run.log(
+            {
+                "plateau/triggered":     1,
+                "plateau/step":          step,
+                "plateau/recent_best":   plateau_event["recent_best"],
+                "plateau/previous_best": plateau_event["previous_best"],
+            },
+            step=step,
+        )
+        run.summary["plateau/triggered"] = True
+        run.summary["plateau/step"]      = step
+    except Exception as exc:  # noqa: BLE001
+        _locked_print(f"  [warn] W&B plateau log failed: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # W&B artifact upload
 # ---------------------------------------------------------------------------
@@ -305,6 +348,7 @@ _LOG_FILES = [
     "command.txt",
     "metrics.jsonl",
     "eval.jsonl",
+    "plateau.json",
     "stdout.log",
     "stderr.log",
 ]
@@ -534,12 +578,17 @@ def launch(
         _on_eval_event(event)
         if wb_run is not None:
             _wb_log_eval(event, wb_run)
-        if plateau is not None and _proc_ref and plateau.check(event):
-            _locked_print(
-                f"\033[33m[plateau]\033[0m  ELO gain < {plateau.min_elo_gain:+.0f} "
-                f"over last {plateau.patience_evals} evals — stopping gracefully"
-            )
-            graceful_stop(_proc_ref[0])
+        if plateau is not None and _proc_ref:
+            plateau_event = plateau.check(event)
+            if plateau_event:
+                _locked_print(
+                    f"\033[33m[plateau]\033[0m  {plateau_event['reason']}"
+                    " — stopping gracefully"
+                )
+                _write_plateau_event(run_dir, plateau_event)
+                if wb_run is not None:
+                    _wb_log_plateau(plateau_event, wb_run)
+                graceful_stop(_proc_ref[0])
 
     # JSONL tail threads — start before the process so we catch the first write.
     t_metrics_tail = threading.Thread(
