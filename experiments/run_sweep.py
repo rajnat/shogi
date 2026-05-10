@@ -34,6 +34,7 @@ from run_experiment import (
     format_command,
     launch,
     upload_run_artifacts,
+    _make_plateau_detector,
 )
 
 
@@ -132,7 +133,7 @@ def main(argv: list[str] | None = None) -> None:
         print(f"[sweep] params: {sweep_params}")
         print(f"[sweep] run_dir: {run_dir}\n")
 
-        rc = launch(cmd, run_dir, wb_run=run)
+        rc = launch(cmd, run_dir, wb_run=run, plateau=_make_plateau_detector(cfg))
         upload_run_artifacts(run_dir, run, cfg)
         run.finish(exit_code=rc)
 

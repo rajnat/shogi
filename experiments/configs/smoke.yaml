@@ -14,6 +14,13 @@ wandb:
   upload_artifacts: true
   upload_checkpoints: final_only
 
+plateau:
+  enabled: false
+  opponent_kind: anchor
+  patience_evals: 2
+  min_elo_gain: 1
+  min_step: 0
+
 train:
   channels: 8
   blocks: 2

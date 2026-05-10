@@ -191,6 +191,64 @@ def _on_eval_event(event: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Plateau detection
+# ---------------------------------------------------------------------------
+
+class PlateauDetector:
+    """Detect when ELO improvement has stalled over recent eval events.
+
+    Collects elo_delta from eval events matching *opponent_kind*.  Once
+    *min_step* has been reached and at least *patience_evals* + 1 evaluations
+    have been recorded, compares the best ELO in the most recent
+    *patience_evals* window against the best ELO before that window.
+    Returns True from check() when the gain falls below *min_elo_gain*.
+    """
+
+    def __init__(
+        self,
+        opponent_kind: str,
+        patience_evals: int,
+        min_elo_gain: float,
+        min_step: int,
+    ) -> None:
+        self.opponent_kind = opponent_kind
+        self.patience_evals = patience_evals
+        self.min_elo_gain = min_elo_gain
+        self.min_step = min_step
+        self._history: list[tuple[int, float]] = []  # (step, elo_delta)
+
+    def check(self, event: dict) -> bool:
+        """Return True if a plateau is detected (caller should stop training)."""
+        if event.get("opponent_kind") != self.opponent_kind:
+            return False
+        step = event.get("step", 0)
+        elo  = event.get("elo_delta", 0.0)
+        self._history.append((step, elo))
+
+        if step < self.min_step:
+            return False
+        if len(self._history) < self.patience_evals + 1:
+            return False
+
+        split = len(self._history) - self.patience_evals
+        previous_best = max(e for _, e in self._history[:split])
+        recent_best   = max(e for _, e in self._history[split:])
+        return (recent_best - previous_best) < self.min_elo_gain
+
+
+def _make_plateau_detector(cfg: dict) -> "PlateauDetector | None":
+    p = cfg.get("plateau", {})
+    if not p.get("enabled", False):
+        return None
+    return PlateauDetector(
+        opponent_kind  = p.get("opponent_kind",  "anchor"),
+        patience_evals = p.get("patience_evals", 5),
+        min_elo_gain   = float(p.get("min_elo_gain", 20.0)),
+        min_step       = int(p.get("min_step",   10000)),
+    )
+
+
+# ---------------------------------------------------------------------------
 # W&B metric logging
 # ---------------------------------------------------------------------------
 
@@ -447,12 +505,15 @@ def launch(
     run_dir: Path,
     wb_run=None,
     max_runtime_sec: float | None = None,
+    plateau: "PlateauDetector | None" = None,
 ) -> int:
     """Run *cmd*, tee-ing stdout/stderr to logs while tailing JSONL metrics.
 
     When *wb_run* is provided, each parsed JSONL event is also logged to W&B.
     When *max_runtime_sec* is set, training is stopped gracefully after that
-    many seconds (useful for plateau detection or time-boxed experiments).
+    many seconds (useful for time-boxed experiments).
+    When *plateau* is provided, training is stopped gracefully whenever the
+    detector signals that ELO improvement has stalled.
     """
     stdout_path  = run_dir / "stdout.log"
     stderr_path  = run_dir / "stderr.log"
@@ -460,6 +521,9 @@ def launch(
     eval_path    = run_dir / "eval.jsonl"
 
     stop = threading.Event()
+    # Filled with the Popen object after launch succeeds so that closures
+    # defined before Popen (on_eval) can call graceful_stop on the process.
+    _proc_ref: list[subprocess.Popen] = []
 
     def on_metrics(event: dict) -> None:
         _on_metrics_event(event)
@@ -470,6 +534,12 @@ def launch(
         _on_eval_event(event)
         if wb_run is not None:
             _wb_log_eval(event, wb_run)
+        if plateau is not None and _proc_ref and plateau.check(event):
+            _locked_print(
+                f"\033[33m[plateau]\033[0m  ELO gain < {plateau.min_elo_gain:+.0f} "
+                f"over last {plateau.patience_evals} evals — stopping gracefully"
+            )
+            graceful_stop(_proc_ref[0])
 
     # JSONL tail threads — start before the process so we catch the first write.
     t_metrics_tail = threading.Thread(
@@ -501,6 +571,8 @@ def launch(
             ferr.write(msg)
             stop.set()
             return 127
+
+        _proc_ref.append(proc)  # make proc visible to on_eval closure
 
         if max_runtime_sec is not None:
             def _watchdog() -> None:
@@ -588,9 +660,22 @@ def main(argv: list[str] | None = None) -> None:
             sys.exit(rc)
 
     wb_run = init_wandb(cfg, run_dir)
+    plateau = _make_plateau_detector(cfg)
+    if plateau is not None:
+        print(
+            f"Plateau detection: opponent={plateau.opponent_kind!r}  "
+            f"patience={plateau.patience_evals} evals  "
+            f"min_elo_gain={plateau.min_elo_gain:+.0f}  "
+            f"min_step={plateau.min_step}"
+        )
 
     print("\nLaunching training…\n")
-    rc = launch(cmd, run_dir, wb_run=wb_run, max_runtime_sec=args.max_runtime_sec)
+    rc = launch(
+        cmd, run_dir,
+        wb_run=wb_run,
+        max_runtime_sec=args.max_runtime_sec,
+        plateau=plateau,
+    )
 
     if wb_run is not None:
         upload_run_artifacts(run_dir, wb_run, cfg)
