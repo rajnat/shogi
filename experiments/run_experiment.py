@@ -465,6 +465,21 @@ def upload_run_artifacts(run_dir: Path, wb_run, cfg: dict) -> None:
 # W&B initialisation
 # ---------------------------------------------------------------------------
 
+def force_wandb_online(cfg: dict) -> None:
+    """Mutate *cfg* to enable W&B in online mode with artifact upload.
+
+    Called when the user passes --wandb on the CLI.  Overrides whatever the
+    YAML says so the flag is the single control point for W&B runs.
+    """
+    wb = cfg.setdefault("wandb", {})
+    wb["enabled"]            = True
+    wb["mode"]               = "online"
+    wb["upload_artifacts"]   = True
+    wb.setdefault("upload_checkpoints", "final_only")
+    wb.setdefault("project", "Shogi")
+    wb.setdefault("entity",  "rajnat")
+
+
 def init_wandb(cfg: dict, run_dir: Path) -> "wandb.sdk.wandb_run.Run | None":
     """Initialise a W&B run if wandb.enabled is true in *cfg*.
 
@@ -698,9 +713,14 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--max-runtime-sec", type=float, default=None,
                         metavar="SEC",
                         help="Stop training gracefully after this many seconds")
+    parser.add_argument("--wandb", action="store_true",
+                        help="Enable W&B online logging + artifact upload "
+                             "(overrides config; requires WANDB_API_KEY)")
     args = parser.parse_args(argv)
 
     cfg: dict = yaml.safe_load(args.config.read_text())
+    if args.wandb:
+        force_wandb_online(cfg)
     run_dir = make_run_dir(cfg)
     run_dir.mkdir(parents=True, exist_ok=True)
 

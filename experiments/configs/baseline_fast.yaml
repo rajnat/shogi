@@ -6,10 +6,9 @@ rust_binary: target/release/shogi
 build_release: true
 
 wandb:
-  enabled: true
+  enabled: false
   project: Shogi
   entity: rajnat
-  mode: online
   tags: [baseline]
   upload_artifacts: true
   upload_checkpoints: final_only

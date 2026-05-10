@@ -40,6 +40,7 @@ from run_experiment import (
     launch,
     init_wandb,
     upload_run_artifacts,
+    force_wandb_online,
     _make_plateau_detector,
     _env_with_libtorch,
 )
@@ -109,10 +110,16 @@ def main(argv: list[str] | None = None) -> None:
                         help="Print resolved configs without launching training")
     parser.add_argument("--max-runtime-sec", type=float, default=None, metavar="SEC",
                         help="Per-run time cap passed to each launch()")
+    parser.add_argument("--wandb", action="store_true",
+                        help="Enable W&B online logging + artifact upload "
+                             "for every run (overrides config; requires WANDB_API_KEY)")
     args = parser.parse_args(argv)
 
     sweep_cfg: dict = yaml.safe_load(args.config.read_text())
     base_cfg: dict  = yaml.safe_load(Path(sweep_cfg["base_config"]).read_text())
+
+    if args.wandb:
+        force_wandb_online(base_cfg)
 
     sweep_name: str       = sweep_cfg.get("sweep_name", "sweep")
     seeds: list[int]      = sweep_cfg.get("seeds", [base_cfg.get("seed", 42)])
