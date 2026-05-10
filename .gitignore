@@ -2,3 +2,7 @@
 /libtorch-*.zip
 /runs
 /checkpoints
+/experiments/.venv
+/experiments/wandb
+__pycache__/
+*.pyc

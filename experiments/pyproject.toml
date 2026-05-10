@@ -1,0 +1,23 @@
+[project]
+name = "shogi-experiments"
+version = "0.1.0"
+description = "Python experiment-tracking layer for the Shogi AlphaZero engine"
+requires-python = ">=3.11"
+dependencies = [
+    "wandb>=0.18",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+rich = ["rich>=13"]
+full  = ["rich>=13", "pandas>=2"]
+
+[project.scripts]
+shogi-watch = "experiments.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/experiments"]
