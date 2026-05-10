@@ -18,3 +18,4 @@ pub mod replay_buffer;
 pub mod worker;
 pub mod train;
 pub mod orchestrate;
+pub mod metrics;
