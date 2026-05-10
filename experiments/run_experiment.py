@@ -190,6 +190,54 @@ def _on_eval_event(event: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# W&B metric logging
+# ---------------------------------------------------------------------------
+
+def _wb_log_metrics(event: dict, run) -> None:
+    etype = event.get("type")
+    step  = event.get("step")
+    try:
+        if etype == "train":
+            run.log(
+                {
+                    "train/total_loss":    event["total_loss"],
+                    "train/policy_loss":   event["policy_loss"],
+                    "train/value_loss":    event["value_loss"],
+                    "data/buffer_size":    event["buffer_size"],
+                    "time/wall_time_sec":  event["wall_time_sec"],
+                },
+                step=step,
+            )
+        elif etype == "checkpoint":
+            run.log({"checkpoint/step": step}, step=step)
+            # Path is not a scalar; store it as a summary value.
+            run.summary["checkpoint/latest_step"] = step
+            run.summary["checkpoint/latest_path"] = event.get("path", "")
+    except Exception as exc:  # noqa: BLE001
+        _locked_print(f"  [warn] W&B log failed ({etype}): {exc}")
+
+
+def _wb_log_eval(event: dict, run) -> None:
+    kind = event.get("opponent_kind", "unknown")
+    step = event.get("step")
+    try:
+        run.log(
+            {
+                f"eval/{kind}/score":      event["score"],
+                f"eval/{kind}/elo_delta":  event["elo_delta"],
+                f"eval/{kind}/elo_ci_low": event["elo_ci_low"],
+                f"eval/{kind}/elo_ci_high":event["elo_ci_high"],
+                f"eval/{kind}/wins":       event["wins"],
+                f"eval/{kind}/draws":      event["draws"],
+                f"eval/{kind}/losses":     event["losses"],
+            },
+            step=step,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _locked_print(f"  [warn] W&B eval log failed ({kind}): {exc}")
+
+
+# ---------------------------------------------------------------------------
 # W&B initialisation
 # ---------------------------------------------------------------------------
 
@@ -264,8 +312,11 @@ def _env_with_libtorch() -> dict[str, str]:
     return env
 
 
-def launch(cmd: list[str], run_dir: Path) -> int:
-    """Run *cmd*, tee-ing stdout/stderr to logs while tailing JSONL metrics."""
+def launch(cmd: list[str], run_dir: Path, wb_run=None) -> int:
+    """Run *cmd*, tee-ing stdout/stderr to logs while tailing JSONL metrics.
+
+    When *wb_run* is provided, each parsed JSONL event is also logged to W&B.
+    """
     stdout_path  = run_dir / "stdout.log"
     stderr_path  = run_dir / "stderr.log"
     metrics_path = run_dir / "metrics.jsonl"
@@ -273,15 +324,25 @@ def launch(cmd: list[str], run_dir: Path) -> int:
 
     stop = threading.Event()
 
+    def on_metrics(event: dict) -> None:
+        _on_metrics_event(event)
+        if wb_run is not None:
+            _wb_log_metrics(event, wb_run)
+
+    def on_eval(event: dict) -> None:
+        _on_eval_event(event)
+        if wb_run is not None:
+            _wb_log_eval(event, wb_run)
+
     # JSONL tail threads — start before the process so we catch the first write.
     t_metrics_tail = threading.Thread(
         target=_tail_jsonl,
-        args=(metrics_path, stop, _on_metrics_event),
+        args=(metrics_path, stop, on_metrics),
         daemon=True,
     )
     t_eval_tail = threading.Thread(
         target=_tail_jsonl,
-        args=(eval_path, stop, _on_eval_event),
+        args=(eval_path, stop, on_eval),
         daemon=True,
     )
     t_metrics_tail.start()
@@ -377,7 +438,7 @@ def main(argv: list[str] | None = None) -> None:
     wb_run = init_wandb(cfg, run_dir)
 
     print("\nLaunching training…\n")
-    rc = launch(cmd, run_dir)
+    rc = launch(cmd, run_dir, wb_run=wb_run)
 
     if wb_run is not None:
         wb_run.finish(exit_code=rc)
