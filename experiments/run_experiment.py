@@ -276,16 +276,28 @@ def _wb_log_metrics(event: dict, run) -> None:
     step  = event.get("step")
     try:
         if etype == "train":
-            run.log(
-                {
-                    "train/total_loss":    event["total_loss"],
-                    "train/policy_loss":   event["policy_loss"],
-                    "train/value_loss":    event["value_loss"],
-                    "data/buffer_size":    event["buffer_size"],
-                    "time/wall_time_sec":  event["wall_time_sec"],
-                },
-                step=step,
-            )
+            payload: dict = {
+                "train/total_loss":          event["total_loss"],
+                "train/policy_loss":         event["policy_loss"],
+                "train/value_loss":          event["value_loss"],
+                "data/buffer_size":          event["buffer_size"],
+                "data/selfplay_games":       event["selfplay_games"],
+                "data/selfplay_positions":   event["selfplay_positions"],
+                "data/games_per_sec":        event["games_per_sec"],
+                "data/positions_per_sec":    event["positions_per_sec"],
+                "data/avg_game_length":      event["avg_game_length"],
+                "time/wall_time_sec":        event["wall_time_sec"],
+                # Exploration / policy quality
+                "entropy/visit":             event["avg_visit_entropy"],
+                "entropy/policy":            event["avg_policy_entropy"],
+                # Outcome breakdown (fractions, easier to compare across runs)
+                "outcomes/black_win_rate":   _safe_rate(event, "selfplay_black_wins",    "selfplay_games"),
+                "outcomes/white_win_rate":   _safe_rate(event, "selfplay_white_wins",    "selfplay_games"),
+                "outcomes/draw_rate":        _safe_rate(event, "selfplay_draws",         "selfplay_games"),
+                "outcomes/resign_rate":      _safe_rate(event, "selfplay_resigns",       "selfplay_games"),
+                "outcomes/max_move_rate":    _safe_rate(event, "selfplay_max_move_draws","selfplay_games"),
+            }
+            run.log(payload, step=step)
         elif etype == "checkpoint":
             run.log({"checkpoint/step": step}, step=step)
             # Path is not a scalar; store it as a summary value.
@@ -293,6 +305,14 @@ def _wb_log_metrics(event: dict, run) -> None:
             run.summary["checkpoint/latest_path"] = event.get("path", "")
     except Exception as exc:  # noqa: BLE001
         _locked_print(f"  [warn] W&B log failed ({etype}): {exc}")
+
+
+def _safe_rate(event: dict, num_key: str, denom_key: str) -> float:
+    """Return num/denom from *event*, or 0.0 when denom is zero."""
+    denom = event.get(denom_key, 0)
+    if not denom:
+        return 0.0
+    return event.get(num_key, 0) / denom
 
 
 def _wb_log_eval(event: dict, run) -> None:

@@ -1,6 +1,6 @@
-project: shogi-core
-run_name: baseline_fast
-group: baseline
+project: Shogi
+run_name: cpuct_sweep
+group: cpuct_sweep
 seed: 42
 rust_binary: target/release/shogi
 build_release: true
@@ -10,7 +10,7 @@ wandb:
   project: Shogi
   entity: rajnat
   mode: online
-  tags: [baseline]
+  tags: [cpuct-sweep]
   upload_artifacts: true
   upload_checkpoints: final_only
 
@@ -19,7 +19,7 @@ plateau:
   opponent_kind: anchor
   patience_evals: 5
   min_elo_gain: 20
-  min_step: 10000
+  min_step: 5000
 
 train:
   channels: 64
@@ -37,7 +37,7 @@ train:
   temperature_low: 0.0
   temperature_drop_ply: 30
   max_moves: 256
-  total_steps: 10000
-  checkpoint_every: 500
+  total_steps: 3000
+  checkpoint_every: 250
   pit_games: 20
   log_every: 50

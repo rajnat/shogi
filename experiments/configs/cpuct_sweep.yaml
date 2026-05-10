@@ -1,6 +1,6 @@
-base_config: experiments/configs/baseline_fast.yaml
+base_config: experiments/configs/cpuct_sweep_base.yaml
 sweep_name: cpuct_fast
-seeds: [1, 2, 3]
+seeds: [42]
 
 parameters:
   train.c_puct: [0.5, 1.0, 1.5, 2.5]
