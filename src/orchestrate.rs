@@ -111,6 +111,44 @@ pub fn elo_delta(wins: u32, draws: u32, losses: u32) -> f64 {
     400.0 * (score / (1.0 - score)).log10()
 }
 
+/// Score rate: (wins + 0.5·draws) / total.  Returns 0.0 for zero games.
+pub fn score_rate(wins: u32, draws: u32, losses: u32) -> f64 {
+    let total = (wins + draws + losses) as f64;
+    if total == 0.0 {
+        return 0.0;
+    }
+    (wins as f64 + 0.5 * draws as f64) / total
+}
+
+/// 95% normal-approximate confidence interval for the score rate.
+///
+/// Uses the standard error `se = sqrt(s·(1−s)/n)` and returns
+/// `(s − 1.96·se, s + 1.96·se)` clamped to `[0, 1]`.
+/// Returns `(0.0, 1.0)` (maximum uncertainty) when total is zero.
+pub fn score_ci95(wins: u32, draws: u32, losses: u32) -> (f64, f64) {
+    let total = (wins + draws + losses) as f64;
+    if total == 0.0 {
+        return (0.0, 1.0);
+    }
+    let s = score_rate(wins, draws, losses);
+    let se = (s * (1.0 - s) / total).sqrt();
+    let low  = (s - 1.96 * se).clamp(0.0, 1.0);
+    let high = (s + 1.96 * se).clamp(0.0, 1.0);
+    (low, high)
+}
+
+/// Convert a score in (0, 1) to an ELO delta using the logistic formula.
+/// Returns ±∞ at the boundary; callers should clamp as needed.
+fn elo_from_score(score: f64) -> f64 {
+    if score <= 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    if score >= 1.0 {
+        return f64::INFINITY;
+    }
+    400.0 * (score / (1.0 - score)).log10()
+}
+
 /// A minimal `SelfPlayConfig` for pit games: greedy, no noise, fast.
 fn pit_sp_config(num_simulations: u32) -> SelfPlayConfig {
     SelfPlayConfig {
@@ -204,9 +242,15 @@ pub fn pit_and_log<R: Rng>(
         trainer.device,
         rng,
     );
-    let score = (w as f64 + 0.5 * d as f64) / config.pit_games as f64;
-    let delta = elo_delta(w, d, l).clamp(-800.0, 800.0);
-    println!("Pit result: +{w}={d}-{l}  score={score:.3}  ELO Δ = {delta:+.1}");
+    let score = score_rate(w, d, l);
+    let (ci_low, ci_high) = score_ci95(w, d, l);
+    let delta      = elo_delta(w, d, l).clamp(-800.0, 800.0);
+    let elo_ci_low  = elo_from_score(ci_low).clamp(-800.0, 800.0);
+    let elo_ci_high = elo_from_score(ci_high).clamp(-800.0, 800.0);
+    println!(
+        "Pit result: +{w}={d}-{l}  score={score:.3} [{ci_low:.3},{ci_high:.3}]  \
+         ELO Δ = {delta:+.1} [{elo_ci_low:+.1},{elo_ci_high:+.1}]"
+    );
     Some(crate::metrics::EvalEvent {
         step: trainer.step,
         new_checkpoint: new_path.display().to_string(),
@@ -217,7 +261,11 @@ pub fn pit_and_log<R: Rng>(
         draws: d,
         losses: l,
         score,
+        score_ci_low: ci_low,
+        score_ci_high: ci_high,
         elo_delta: delta,
+        elo_ci_low,
+        elo_ci_high,
         wall_time_sec,
     })
 }
@@ -838,13 +886,126 @@ mod tests {
         assert_eq!(ev["step"], 2);
         assert_eq!(ev["opponent_kind"], "previous");
         assert_eq!(ev["games"], 2);
-        assert!((ev["wins"].as_u64().unwrap()
-            + ev["draws"].as_u64().unwrap()
-            + ev["losses"].as_u64().unwrap()) == 2);
+        let w = ev["wins"].as_u64().unwrap();
+        let d = ev["draws"].as_u64().unwrap();
+        let l = ev["losses"].as_u64().unwrap();
+        assert_eq!(w + d + l, 2);
         assert!(ev["score"].as_f64().unwrap() >= 0.0);
+        assert!(ev["score_ci_low"].as_f64().is_some());
+        assert!(ev["score_ci_high"].as_f64().is_some());
         assert!(ev["elo_delta"].as_f64().is_some());
+        assert!(ev["elo_ci_low"].as_f64().is_some());
+        assert!(ev["elo_ci_high"].as_f64().is_some());
         assert!(ev["wall_time_sec"].as_f64().unwrap() >= 0.0);
         assert!(ev["new_checkpoint"].as_str().unwrap().ends_with("step_00000002.ot"));
         assert!(ev["opponent_checkpoint"].as_str().unwrap().ends_with("step_00000001.ot"));
+    }
+
+    // ----- score_rate -----
+
+    #[test]
+    fn test_score_rate_zero_games() {
+        assert_eq!(score_rate(0, 0, 0), 0.0);
+    }
+
+    #[test]
+    fn test_score_rate_all_wins() {
+        assert_eq!(score_rate(10, 0, 0), 1.0);
+    }
+
+    #[test]
+    fn test_score_rate_all_losses() {
+        assert_eq!(score_rate(0, 0, 10), 0.0);
+    }
+
+    #[test]
+    fn test_score_rate_all_draws() {
+        assert!((score_rate(0, 10, 0) - 0.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_score_rate_mixed() {
+        // 3W 2D 5L → (3 + 1) / 10 = 0.4
+        assert!((score_rate(3, 2, 5) - 0.4).abs() < 1e-10);
+    }
+
+    // ----- score_ci95 -----
+
+    #[test]
+    fn test_score_ci95_zero_games_returns_maximum_uncertainty() {
+        let (lo, hi) = score_ci95(0, 0, 0);
+        assert_eq!(lo, 0.0);
+        assert_eq!(hi, 1.0);
+    }
+
+    #[test]
+    fn test_score_ci95_is_within_unit_interval() {
+        for (w, d, l) in [(0u32,0,1),(1,0,0),(0,10,0),(5,0,5),(100,0,0),(0,0,100)] {
+            let (lo, hi) = score_ci95(w, d, l);
+            assert!(lo >= 0.0 && lo <= 1.0, "lo={lo} out of [0,1] for ({w},{d},{l})");
+            assert!(hi >= 0.0 && hi <= 1.0, "hi={hi} out of [0,1] for ({w},{d},{l})");
+            assert!(lo <= hi, "lo > hi for ({w},{d},{l})");
+        }
+    }
+
+    #[test]
+    fn test_score_ci95_symmetric_at_half() {
+        // Equal wins and losses → score = 0.5; CI should be symmetric around 0.5.
+        let (lo, hi) = score_ci95(50, 0, 50);
+        assert!((lo + hi - 1.0).abs() < 1e-10, "CI not symmetric: [{lo:.4},{hi:.4}]");
+    }
+
+    #[test]
+    fn test_score_ci95_narrows_with_more_games() {
+        let (lo10, hi10)     = score_ci95(5, 0, 5);
+        let (lo1000, hi1000) = score_ci95(500, 0, 500);
+        assert!(hi1000 - lo1000 < hi10 - lo10, "CI should narrow with more games");
+    }
+
+    #[test]
+    fn test_score_ci95_all_wins_clamped() {
+        let (lo, hi) = score_ci95(10, 0, 0);
+        assert_eq!(lo, 1.0, "lower bound for all-wins should clamp to 1.0");
+        assert_eq!(hi, 1.0, "upper bound for all-wins should clamp to 1.0");
+    }
+
+    #[test]
+    fn test_score_ci95_all_losses_clamped() {
+        let (lo, hi) = score_ci95(0, 0, 10);
+        assert_eq!(lo, 0.0);
+        assert_eq!(hi, 0.0);
+    }
+
+    // ----- elo CI via pit_and_log -----
+
+    #[test]
+    fn test_elo_ci_bounds_ordered() {
+        // The ELO CI endpoints must satisfy low ≤ elo_delta ≤ high.
+        let t = small_trainer();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("net.ot");
+        t.vs.save(&path).unwrap();
+
+        let cfg = OrchestrationConfig {
+            pit_games: 10,
+            checkpoint_every: 0,
+            checkpoint_dir: String::new(),
+            ..OrchestrationConfig::default()
+        };
+        let mut rng = StdRng::seed_from_u64(7);
+        if let Some(ev) = pit_and_log(&path, &path, &t, &cfg, &mut rng, 0.0) {
+            assert!(
+                ev.elo_ci_low <= ev.elo_delta,
+                "elo_ci_low ({:.1}) > elo_delta ({:.1})",
+                ev.elo_ci_low, ev.elo_delta
+            );
+            assert!(
+                ev.elo_delta <= ev.elo_ci_high,
+                "elo_delta ({:.1}) > elo_ci_high ({:.1})",
+                ev.elo_delta, ev.elo_ci_high
+            );
+            assert!(ev.score_ci_low <= ev.score);
+            assert!(ev.score <= ev.score_ci_high);
+        }
     }
 }

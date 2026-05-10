@@ -44,7 +44,11 @@ pub struct EvalEvent {
     pub draws: u32,
     pub losses: u32,
     pub score: f64,
+    pub score_ci_low: f64,
+    pub score_ci_high: f64,
     pub elo_delta: f64,
+    pub elo_ci_low: f64,
+    pub elo_ci_high: f64,
     pub wall_time_sec: f64,
 }
 
