@@ -175,16 +175,19 @@ pub fn pit_networks<R: Rng>(
     (wins, draws, losses)
 }
 
-/// Run a pit match and print the result if `config.pit_games > 0` and both paths are present.
+/// Run a pit match, print the result, and return a structured `EvalEvent`.
+///
+/// Returns `None` when `config.pit_games == 0` (pit disabled).
 pub fn pit_and_log<R: Rng>(
     new_path: &Path,
     old_path: &Path,
     trainer: &Trainer,
     config: &OrchestrationConfig,
     rng: &mut R,
-) {
+    wall_time_sec: f64,
+) -> Option<crate::metrics::EvalEvent> {
     if config.pit_games == 0 {
-        return;
+        return None;
     }
     println!(
         "Pitting {} vs {} ({} games)…",
@@ -201,10 +204,22 @@ pub fn pit_and_log<R: Rng>(
         trainer.device,
         rng,
     );
-    let delta = elo_delta(w, d, l);
-    println!(
-        "Pit result: +{w}={d}-{l}  ELO Δ = {delta:+.1}"
-    );
+    let score = (w as f64 + 0.5 * d as f64) / config.pit_games as f64;
+    let delta = elo_delta(w, d, l).clamp(-800.0, 800.0);
+    println!("Pit result: +{w}={d}-{l}  score={score:.3}  ELO Δ = {delta:+.1}");
+    Some(crate::metrics::EvalEvent {
+        step: trainer.step,
+        new_checkpoint: new_path.display().to_string(),
+        opponent_checkpoint: old_path.display().to_string(),
+        opponent_kind: "previous".to_string(),
+        games: config.pit_games,
+        wins: w,
+        draws: d,
+        losses: l,
+        score,
+        elo_delta: delta,
+        wall_time_sec,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -258,6 +273,7 @@ pub fn run_loop<R: Rng>(
     rng: &mut R,
     shutdown: Arc<AtomicBool>,
     mut metrics_writer: Option<&mut JsonlWriter>,
+    mut eval_writer: Option<&mut JsonlWriter>,
 ) {
     wait_for_buffer(&buffer, trainer.min_buffer_size(), config.fill_poll_ms);
 
@@ -301,7 +317,14 @@ pub fn run_loop<R: Rng>(
                         .expect("failed to write checkpoint metrics JSONL");
                 }
                 if let Some(ref old_ckpt) = prev_ckpt {
-                    pit_and_log(&new_ckpt, old_ckpt, trainer, config, rng);
+                    let wt = started_at.elapsed().as_secs_f64();
+                    if let Some(event) = pit_and_log(&new_ckpt, old_ckpt, trainer, config, rng, wt) {
+                        if let Some(writer) = eval_writer.as_deref_mut() {
+                            writer
+                                .write(&event)
+                                .expect("failed to write eval JSONL");
+                        }
+                    }
                 }
                 prev_ckpt = Some(new_ckpt);
             }
@@ -415,6 +438,7 @@ mod tests {
             &mut rng,
             no_shutdown(),
             None,
+            None,
         );
         assert_eq!(t.step, 7, "expected 7 steps, got {}", t.step);
     }
@@ -436,6 +460,7 @@ mod tests {
             &mut rng,
             Arc::clone(&shutdown),
             None,
+            None,
         );
         assert_eq!(t.step, 0, "shutdown-before-start should run 0 steps");
     }
@@ -455,6 +480,7 @@ mod tests {
             &mut rng,
             no_shutdown(),
             None,
+            None,
         );
         assert_eq!(t.step, 10);
     }
@@ -473,6 +499,7 @@ mod tests {
             &fast_config(7, 5),
             &mut rng,
             no_shutdown(),
+            None,
             None,
         );
         assert_eq!(t.step, 7);
@@ -505,6 +532,7 @@ mod tests {
             &mut rng,
             no_shutdown(),
             Some(&mut metrics_writer),
+            None,
         );
 
         let contents = std::fs::read_to_string(metrics_path).unwrap();
@@ -540,7 +568,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
             sd2.store(true, Ordering::Relaxed);
         });
-        run_loop(&mut t, buf, None, &fast_config(0, 1), &mut rng, shutdown, None);
+        run_loop(&mut t, buf, None, &fast_config(0, 1), &mut rng, shutdown, None, None);
         assert!(
             t.step > 0,
             "should have run at least one step before shutdown"
@@ -652,7 +680,7 @@ mod tests {
             checkpoint_dir: dir.path().to_str().unwrap().to_string(),
             pit_games: 0, // disabled: pit would be too slow for a unit test
         };
-        run_loop(&mut t, buf, None, &cfg, &mut rng, no_shutdown(), None);
+        run_loop(&mut t, buf, None, &cfg, &mut rng, no_shutdown(), None, None);
         assert_eq!(t.step, 10);
         assert!(dir.path().join("step_00000005.ot").exists(), "checkpoint at step 5");
         assert!(dir.path().join("step_00000010.ot").exists(), "checkpoint at step 10");
@@ -683,6 +711,7 @@ mod tests {
             &mut rng,
             no_shutdown(),
             Some(&mut metrics_writer),
+            None,
         );
 
         let contents = std::fs::read_to_string(metrics_path).unwrap();
@@ -762,5 +791,60 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
         let (w, d, l) = pit_networks(&path, &path, t.channels, t.blocks, 2, Device::Cpu, &mut rng);
         assert_eq!(w + d + l, 2, "win+draw+loss must equal games");
+    }
+
+    // ----- eval JSONL -----
+
+    #[test]
+    fn test_run_loop_writes_eval_event_after_second_checkpoint() {
+        // checkpoint_every=1, pit_games=2, total_steps=2:
+        // step 1 → first checkpoint (no previous → no pit)
+        // step 2 → second checkpoint (previous exists → pit fires → eval event)
+        let mut t = small_trainer();
+        let buf = filled_buffer(t.min_buffer_size());
+        let mut rng = StdRng::seed_from_u64(0);
+        let dir = tempfile::tempdir().unwrap();
+        let eval_path = dir.path().join("eval.jsonl");
+        let mut eval_writer = crate::metrics::JsonlWriter::new(&eval_path).unwrap();
+        let cfg = OrchestrationConfig {
+            total_steps: 2,
+            steps_per_broadcast: 100,
+            fill_poll_ms: 1,
+            checkpoint_every: 1,
+            checkpoint_dir: dir.path().join("checkpoints").to_str().unwrap().to_string(),
+            pit_games: 2,
+        };
+
+        run_loop(
+            &mut t,
+            buf,
+            None,
+            &cfg,
+            &mut rng,
+            no_shutdown(),
+            None,
+            Some(&mut eval_writer),
+        );
+
+        let contents = std::fs::read_to_string(&eval_path).unwrap();
+        let events: Vec<serde_json::Value> = contents
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+
+        assert_eq!(events.len(), 1, "exactly one eval event (step 2 vs step 1)");
+        let ev = &events[0];
+        assert_eq!(ev["step"], 2);
+        assert_eq!(ev["opponent_kind"], "previous");
+        assert_eq!(ev["games"], 2);
+        assert!((ev["wins"].as_u64().unwrap()
+            + ev["draws"].as_u64().unwrap()
+            + ev["losses"].as_u64().unwrap()) == 2);
+        assert!(ev["score"].as_f64().unwrap() >= 0.0);
+        assert!(ev["elo_delta"].as_f64().is_some());
+        assert!(ev["wall_time_sec"].as_f64().unwrap() >= 0.0);
+        assert!(ev["new_checkpoint"].as_str().unwrap().ends_with("step_00000002.ot"));
+        assert!(ev["opponent_checkpoint"].as_str().unwrap().ends_with("step_00000001.ot"));
     }
 }

@@ -36,8 +36,16 @@ pub struct CheckpointEvent {
 #[derive(Debug, Clone, Serialize)]
 pub struct EvalEvent {
     pub step: u64,
+    pub new_checkpoint: String,
+    pub opponent_checkpoint: String,
+    pub opponent_kind: String,
     pub games: u64,
-    pub win_rate: f64,
+    pub wins: u32,
+    pub draws: u32,
+    pub losses: u32,
+    pub score: f64,
+    pub elo_delta: f64,
+    pub wall_time_sec: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]

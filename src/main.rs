@@ -444,7 +444,10 @@ fn main() {
                 JsonlWriter::new(&metrics_jsonl_path)
                     .expect("failed to create metrics JSONL writer"),
             );
-            let _ = &eval_jsonl_path;
+            let mut eval_writer = Some(
+                JsonlWriter::new(&eval_jsonl_path)
+                    .expect("failed to create eval JSONL writer"),
+            );
 
             let train_config = TrainConfig {
                 batch_size,
@@ -516,6 +519,7 @@ fn main() {
                 &mut rng,
                 shutdown,
                 metrics_writer.as_mut(),
+                eval_writer.as_mut(),
             );
 
             if let Some(p) = pool {
