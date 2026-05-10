@@ -96,6 +96,9 @@ enum Commands {
         /// Maximum half-moves before a self-play game is declared drawn
         #[arg(long, default_value_t = 512)]
         max_moves: usize,
+        /// Leaf positions batched per neural-net MCTS evaluation
+        #[arg(long, default_value_t = 8)]
+        mcts_batch_size: usize,
         /// Number of pit games to play after each checkpoint (0 = skip)
         #[arg(long, default_value_t = 100)]
         pit_games: u64,
@@ -208,6 +211,8 @@ mod tests {
             "3",
             "--max-moves",
             "128",
+            "--mcts-batch-size",
+            "16",
         ])
         .expect("train CLI should parse self-play hyperparameters");
 
@@ -223,6 +228,7 @@ mod tests {
             resign_min_ply,
             resign_consecutive,
             max_moves,
+            mcts_batch_size,
             ..
         }) = cli.command
         else {
@@ -240,6 +246,7 @@ mod tests {
         assert_eq!(resign_min_ply, 12);
         assert_eq!(resign_consecutive, 3);
         assert_eq!(max_moves, 128);
+        assert_eq!(mcts_batch_size, 16);
     }
 }
 
@@ -287,6 +294,7 @@ fn main() {
             resign_min_ply,
             resign_consecutive,
             max_moves,
+            mcts_batch_size,
             pit_games,
             resume,
         } => {
@@ -337,6 +345,7 @@ fn main() {
                 dirichlet_alpha,
                 dirichlet_epsilon,
                 c_puct,
+                mcts_batch_size,
             };
 
             let pool = if workers > 0 {

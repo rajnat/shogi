@@ -29,7 +29,7 @@ use crate::mcts::search::{eval_with_net, mcts_search_with_evaluator};
 use crate::mcts::{Arena, MctsConfig, NodeIdx};
 use crate::movegen::generate_legal_moves;
 use crate::moves::make_move_full;
-use crate::nn::{NUM_ACTIONS, Net, encode, move_to_index};
+use crate::nn::{encode, move_to_index, Net, NUM_ACTIONS};
 use crate::types::Color;
 
 // ---------------------------------------------------------------------------
@@ -61,6 +61,8 @@ pub struct SelfPlayConfig {
     pub dirichlet_epsilon: f32,
     /// c_puct exploration constant for PUCT selection.
     pub c_puct: f32,
+    /// Number of leaf positions batched per neural-net MCTS evaluation.
+    pub mcts_batch_size: usize,
 }
 
 impl Default for SelfPlayConfig {
@@ -77,6 +79,7 @@ impl Default for SelfPlayConfig {
             dirichlet_alpha: 0.15,
             dirichlet_epsilon: 0.25,
             c_puct: 1.0,
+            mcts_batch_size: 8,
         }
     }
 }
@@ -156,7 +159,7 @@ pub fn play_game(
         dirichlet_epsilon: config.dirichlet_epsilon,
         dirichlet_noise: true, // always on during self-play
         temperature: config.temperature_high,
-        batch_size: 8,
+        batch_size: config.mcts_batch_size,
     };
 
     let mut board = Board::startpos();
@@ -309,7 +312,7 @@ pub fn play_pit_game(
         dirichlet_epsilon: 0.0, // no noise during evaluation
         dirichlet_noise: false,
         temperature: config.temperature_low,
-        batch_size: 8,
+        batch_size: config.mcts_batch_size,
     };
 
     let mut board = Board::startpos();
@@ -325,7 +328,11 @@ pub fn play_pit_game(
             break;
         }
 
-        let net = if board.side_to_move == Color::Black { net_black } else { net_white };
+        let net = if board.side_to_move == Color::Black {
+            net_black
+        } else {
+            net_white
+        };
         let call_count = std::cell::Cell::new(0u32);
         let root_value = std::cell::Cell::new(0.0f32);
 
@@ -364,12 +371,20 @@ pub fn play_pit_game(
     }
 
     if resigned {
-        if board.side_to_move == Color::Black { -1.0 } else { 1.0 }
+        if board.side_to_move == Color::Black {
+            -1.0
+        } else {
+            1.0
+        }
     } else {
         let mut probe = Vec::new();
         generate_legal_moves(&mut board, &mut probe);
         if probe.is_empty() {
-            if board.side_to_move == Color::Black { -1.0 } else { 1.0 }
+            if board.side_to_move == Color::Black {
+                -1.0
+            } else {
+                1.0
+            }
         } else {
             0.0
         }
@@ -406,7 +421,7 @@ mod tests {
     fn test_visit_distribution_sums_to_one() {
         use crate::board::Board;
         use crate::mcts::search::expand;
-        use crate::mcts::{Arena, NO_PARENT, Node};
+        use crate::mcts::{Arena, Node, NO_PARENT};
         use crate::nn::move_index::NUM_ACTIONS;
 
         let mut board = Board::startpos();
@@ -433,7 +448,7 @@ mod tests {
     fn test_visit_distribution_zero_visits_returns_zeros() {
         use crate::board::Board;
         use crate::mcts::search::expand;
-        use crate::mcts::{Arena, NO_PARENT, Node};
+        use crate::mcts::{Arena, Node, NO_PARENT};
 
         let mut board = Board::startpos();
         let mut arena = Arena::new(512);
@@ -449,7 +464,7 @@ mod tests {
     fn test_visit_distribution_correct_action_slot() {
         use crate::board::Board;
         use crate::mcts::search::expand;
-        use crate::mcts::{Arena, NO_PARENT, Node};
+        use crate::mcts::{Arena, Node, NO_PARENT};
         use crate::nn::move_to_index;
 
         let mut board = Board::startpos();
