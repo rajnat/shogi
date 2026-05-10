@@ -36,6 +36,10 @@ pub struct OrchestrationConfig {
     pub checkpoint_dir: String,
     /// Number of pit games to play after each checkpoint (0 = skip).
     pub pit_games: u64,
+    /// Fixed anchor checkpoint to evaluate every new checkpoint against.
+    /// When set, emits eval events with opponent_kind = "anchor" and tracks
+    /// the best-so-far checkpoint by anchor score.
+    pub eval_anchor: Option<PathBuf>,
 }
 
 impl Default for OrchestrationConfig {
@@ -47,6 +51,7 @@ impl Default for OrchestrationConfig {
             checkpoint_every: 1000,
             checkpoint_dir: "checkpoints".to_string(),
             pit_games: 100,
+            eval_anchor: None,
         }
     }
 }
@@ -215,6 +220,7 @@ pub fn pit_networks<R: Rng>(
 
 /// Run a pit match, print the result, and return a structured `EvalEvent`.
 ///
+/// `opponent_kind` is written verbatim into the event (e.g. "previous", "anchor", "best").
 /// Returns `None` when `config.pit_games == 0` (pit disabled).
 pub fn pit_and_log<R: Rng>(
     new_path: &Path,
@@ -222,15 +228,17 @@ pub fn pit_and_log<R: Rng>(
     trainer: &Trainer,
     config: &OrchestrationConfig,
     rng: &mut R,
+    opponent_kind: &str,
     wall_time_sec: f64,
 ) -> Option<crate::metrics::EvalEvent> {
     if config.pit_games == 0 {
         return None;
     }
     println!(
-        "Pitting {} vs {} ({} games)…",
+        "Pitting {} vs {} [{}] ({} games)…",
         new_path.display(),
         old_path.display(),
+        opponent_kind,
         config.pit_games
     );
     let (w, d, l) = pit_networks(
@@ -248,14 +256,14 @@ pub fn pit_and_log<R: Rng>(
     let elo_ci_low  = elo_from_score(ci_low).clamp(-800.0, 800.0);
     let elo_ci_high = elo_from_score(ci_high).clamp(-800.0, 800.0);
     println!(
-        "Pit result: +{w}={d}-{l}  score={score:.3} [{ci_low:.3},{ci_high:.3}]  \
+        "Pit [{opponent_kind}]: +{w}={d}-{l}  score={score:.3} [{ci_low:.3},{ci_high:.3}]  \
          ELO Δ = {delta:+.1} [{elo_ci_low:+.1},{elo_ci_high:+.1}]"
     );
     Some(crate::metrics::EvalEvent {
         step: trainer.step,
         new_checkpoint: new_path.display().to_string(),
         opponent_checkpoint: old_path.display().to_string(),
-        opponent_kind: "previous".to_string(),
+        opponent_kind: opponent_kind.to_string(),
         games: config.pit_games,
         wins: w,
         draws: d,
@@ -268,6 +276,16 @@ pub fn pit_and_log<R: Rng>(
         elo_ci_high,
         wall_time_sec,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Best-checkpoint tracking
+// ---------------------------------------------------------------------------
+
+/// Return `true` if `current_score` is strictly better than `best_score`,
+/// meaning the current checkpoint should become the new best.
+pub fn should_update_best(current_score: f64, best_score: f64) -> bool {
+    current_score > best_score
 }
 
 // ---------------------------------------------------------------------------
@@ -327,6 +345,9 @@ pub fn run_loop<R: Rng>(
 
     let started_at = Instant::now();
     let mut prev_ckpt: Option<PathBuf> = None;
+    // Best checkpoint by anchor score; only tracked when eval_anchor is configured.
+    let mut best_ckpt: Option<PathBuf> = None;
+    let mut best_score: f64 = -1.0;
 
     loop {
         for _ in 0..config.steps_per_broadcast {
@@ -355,25 +376,47 @@ pub fn run_loop<R: Rng>(
                 }
             }
             if let Some(new_ckpt) = maybe_checkpoint(&trainer.vs, trainer.step, config) {
+                let wt = started_at.elapsed().as_secs_f64();
                 if let Some(writer) = metrics_writer.as_deref_mut() {
                     writer
                         .write(&MetricEvent::Checkpoint(CheckpointEvent {
                             step: trainer.step,
                             path: new_ckpt.display().to_string(),
-                            wall_time_sec: started_at.elapsed().as_secs_f64(),
+                            wall_time_sec: wt,
                         }))
                         .expect("failed to write checkpoint metrics JSONL");
                 }
+
+                // Pit vs previous checkpoint.
                 if let Some(ref old_ckpt) = prev_ckpt {
-                    let wt = started_at.elapsed().as_secs_f64();
-                    if let Some(event) = pit_and_log(&new_ckpt, old_ckpt, trainer, config, rng, wt) {
+                    if let Some(event) = pit_and_log(&new_ckpt, old_ckpt, trainer, config, rng, "previous", wt) {
                         if let Some(writer) = eval_writer.as_deref_mut() {
-                            writer
-                                .write(&event)
-                                .expect("failed to write eval JSONL");
+                            writer.write(&event).expect("failed to write eval JSONL");
                         }
                     }
                 }
+
+                // Pit vs anchor (if configured) and update best-so-far.
+                if let Some(ref anchor) = config.eval_anchor.clone() {
+                    if let Some(event) = pit_and_log(&new_ckpt, anchor, trainer, config, rng, "anchor", wt) {
+                        if let Some(writer) = eval_writer.as_deref_mut() {
+                            writer.write(&event).expect("failed to write eval JSONL");
+                        }
+                        if should_update_best(event.score, best_score) {
+                            // Pit vs current best before replacing it.
+                            if let Some(ref old_best) = best_ckpt.clone() {
+                                if let Some(best_event) = pit_and_log(&new_ckpt, old_best, trainer, config, rng, "best", wt) {
+                                    if let Some(writer) = eval_writer.as_deref_mut() {
+                                        writer.write(&best_event).expect("failed to write eval JSONL");
+                                    }
+                                }
+                            }
+                            best_ckpt = Some(new_ckpt.clone());
+                            best_score = event.score;
+                        }
+                    }
+                }
+
                 prev_ckpt = Some(new_ckpt);
             }
         }
@@ -444,6 +487,7 @@ mod tests {
             checkpoint_every: 0, // disabled by default in fast tests
             checkpoint_dir: String::new(),
             pit_games: 0,
+            eval_anchor: None,
         }
     }
 
@@ -727,6 +771,7 @@ mod tests {
             checkpoint_every: 5,
             checkpoint_dir: dir.path().to_str().unwrap().to_string(),
             pit_games: 0, // disabled: pit would be too slow for a unit test
+            eval_anchor: None,
         };
         run_loop(&mut t, buf, None, &cfg, &mut rng, no_shutdown(), None, None);
         assert_eq!(t.step, 10);
@@ -749,6 +794,7 @@ mod tests {
             checkpoint_every: 1,
             checkpoint_dir: dir.path().join("checkpoints").to_str().unwrap().to_string(),
             pit_games: 0,
+            eval_anchor: None,
         };
 
         run_loop(
@@ -861,6 +907,7 @@ mod tests {
             checkpoint_every: 1,
             checkpoint_dir: dir.path().join("checkpoints").to_str().unwrap().to_string(),
             pit_games: 2,
+            eval_anchor: None,
         };
 
         run_loop(
@@ -993,7 +1040,7 @@ mod tests {
             ..OrchestrationConfig::default()
         };
         let mut rng = StdRng::seed_from_u64(7);
-        if let Some(ev) = pit_and_log(&path, &path, &t, &cfg, &mut rng, 0.0) {
+        if let Some(ev) = pit_and_log(&path, &path, &t, &cfg, &mut rng, "previous", 0.0) {
             assert!(
                 ev.elo_ci_low <= ev.elo_delta,
                 "elo_ci_low ({:.1}) > elo_delta ({:.1})",
@@ -1006,6 +1053,99 @@ mod tests {
             );
             assert!(ev.score_ci_low <= ev.score);
             assert!(ev.score <= ev.score_ci_high);
+        }
+    }
+
+    // ----- pit_and_log opponent_kind -----
+
+    #[test]
+    fn test_pit_and_log_records_opponent_kind() {
+        let t = small_trainer();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("net.ot");
+        t.vs.save(&path).unwrap();
+
+        let cfg = OrchestrationConfig {
+            pit_games: 2,
+            checkpoint_every: 0,
+            checkpoint_dir: String::new(),
+            ..OrchestrationConfig::default()
+        };
+        let mut rng = StdRng::seed_from_u64(99);
+        let ev = pit_and_log(&path, &path, &t, &cfg, &mut rng, "anchor", 1.5)
+            .expect("pit_and_log should return Some when pit_games > 0");
+        assert_eq!(ev.opponent_kind, "anchor");
+        assert_eq!(ev.wall_time_sec, 1.5);
+    }
+
+    // ----- should_update_best -----
+
+    #[test]
+    fn test_should_update_best_when_strictly_better() {
+        assert!(should_update_best(0.6, 0.5));
+        assert!(should_update_best(0.5, -1.0)); // first checkpoint: best_score sentinel = -1
+        assert!(should_update_best(1.0, 0.999));
+    }
+
+    #[test]
+    fn test_should_update_best_when_equal_or_worse() {
+        assert!(!should_update_best(0.5, 0.5));  // equal: no update
+        assert!(!should_update_best(0.4, 0.5));  // worse: no update
+        assert!(!should_update_best(0.0, 0.0));
+    }
+
+    // ----- anchor eval events in run_loop -----
+
+    #[test]
+    fn test_run_loop_writes_anchor_eval_events() {
+        // Saves a network as the "anchor" before training starts, then
+        // runs 2 steps with checkpoint_every=1.  Each checkpoint should
+        // emit an "anchor" eval event in eval.jsonl.
+        let mut t = small_trainer();
+        let buf = filled_buffer(t.min_buffer_size());
+        let mut rng = StdRng::seed_from_u64(0);
+        let dir = tempfile::tempdir().unwrap();
+
+        // Anchor = random-weight network saved before the loop.
+        let anchor_path = dir.path().join("anchor.ot");
+        t.vs.save(&anchor_path).unwrap();
+
+        let eval_path = dir.path().join("eval.jsonl");
+        let mut eval_writer = crate::metrics::JsonlWriter::new(&eval_path).unwrap();
+        let cfg = OrchestrationConfig {
+            total_steps: 2,
+            steps_per_broadcast: 100,
+            fill_poll_ms: 1,
+            checkpoint_every: 1,
+            checkpoint_dir: dir.path().join("checkpoints").to_str().unwrap().to_string(),
+            pit_games: 2,
+            eval_anchor: Some(anchor_path),
+        };
+
+        run_loop(&mut t, buf, None, &cfg, &mut rng, no_shutdown(), None, Some(&mut eval_writer));
+
+        let contents = std::fs::read_to_string(&eval_path).unwrap();
+        let events: Vec<serde_json::Value> = contents
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+
+        let anchor_events: Vec<_> = events.iter()
+            .filter(|e| e["opponent_kind"] == "anchor")
+            .collect();
+        // Step 1 → anchor pit; step 2 → anchor pit (+ possibly "best" pit).
+        assert!(
+            anchor_events.len() >= 1,
+            "expected at least one anchor eval event, got {}; events: {events:?}",
+            anchor_events.len()
+        );
+        for ev in &anchor_events {
+            assert_eq!(ev["opponent_kind"], "anchor");
+            let w = ev["wins"].as_u64().unwrap();
+            let d = ev["draws"].as_u64().unwrap();
+            let l = ev["losses"].as_u64().unwrap();
+            assert_eq!(w + d + l, 2, "game counts must sum to pit_games");
         }
     }
 }

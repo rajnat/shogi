@@ -117,6 +117,9 @@ enum Commands {
         /// Resume training from this checkpoint file
         #[arg(long)]
         resume: Option<PathBuf>,
+        /// Fixed anchor checkpoint to evaluate every new checkpoint against
+        #[arg(long)]
+        eval_anchor: Option<PathBuf>,
     },
     /// Benchmark neural-net MCTS vs rollout-MCTS baseline
     ///
@@ -317,6 +320,38 @@ mod tests {
         assert_eq!(max_moves, 128);
         assert_eq!(mcts_batch_size, 16);
     }
+
+    #[test]
+    fn train_cli_parses_eval_anchor() {
+        let cli = Cli::try_parse_from([
+            "shogi",
+            "train",
+            "--eval-anchor",
+            "checkpoints/step_00001000.ot",
+        ])
+        .expect("train CLI should parse --eval-anchor");
+
+        let Some(Commands::Train { eval_anchor, .. }) = cli.command else {
+            panic!("expected train command");
+        };
+
+        assert_eq!(
+            eval_anchor,
+            Some(PathBuf::from("checkpoints/step_00001000.ot"))
+        );
+    }
+
+    #[test]
+    fn train_cli_eval_anchor_defaults_to_none() {
+        let cli = Cli::try_parse_from(["shogi", "train"])
+            .expect("train CLI should parse without --eval-anchor");
+
+        let Some(Commands::Train { eval_anchor, .. }) = cli.command else {
+            panic!("expected train command");
+        };
+
+        assert_eq!(eval_anchor, None);
+    }
 }
 
 fn resolve_run_output_paths(
@@ -381,6 +416,7 @@ fn main() {
             seed,
             pit_games,
             resume,
+            eval_anchor,
         } => {
             use rand::rngs::StdRng;
             use rand::SeedableRng;
@@ -508,6 +544,7 @@ fn main() {
                 checkpoint_every,
                 checkpoint_dir,
                 pit_games,
+                eval_anchor,
             };
 
             let mut rng = StdRng::seed_from_u64(seed);
