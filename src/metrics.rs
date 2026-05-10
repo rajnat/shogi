@@ -29,6 +29,7 @@ pub struct TrainEvent {
 pub struct CheckpointEvent {
     pub step: u64,
     pub path: String,
+    pub wall_time_sec: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -97,6 +98,7 @@ mod tests {
             .write(&MetricEvent::Checkpoint(CheckpointEvent {
                 step: 1,
                 path: "checkpoints/step-1.pt".to_string(),
+                wall_time_sec: 0.5,
             }))
             .unwrap();
 
@@ -114,5 +116,6 @@ mod tests {
         assert_eq!(checkpoint_line["type"], "checkpoint");
         assert_eq!(checkpoint_line["step"], 1);
         assert_eq!(checkpoint_line["path"], "checkpoints/step-1.pt");
+        assert_eq!(checkpoint_line["wall_time_sec"], 0.5);
     }
 }

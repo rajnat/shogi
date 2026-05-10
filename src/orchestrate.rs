@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use rand::Rng;
 use tch::Device;
 
-use crate::metrics::{JsonlWriter, MetricEvent, TrainEvent};
+use crate::metrics::{CheckpointEvent, JsonlWriter, MetricEvent, TrainEvent};
 use crate::nn::checkpoint::build_with_config;
 use crate::replay_buffer::ReplayBuffer;
 use crate::selfplay::{SelfPlayConfig, play_pit_game};
@@ -290,17 +290,25 @@ pub fn run_loop<R: Rng>(
                         .expect("failed to write training metrics JSONL");
                 }
             }
+            if let Some(new_ckpt) = maybe_checkpoint(&trainer.vs, trainer.step, config) {
+                if let Some(writer) = metrics_writer.as_deref_mut() {
+                    writer
+                        .write(&MetricEvent::Checkpoint(CheckpointEvent {
+                            step: trainer.step,
+                            path: new_ckpt.display().to_string(),
+                            wall_time_sec: started_at.elapsed().as_secs_f64(),
+                        }))
+                        .expect("failed to write checkpoint metrics JSONL");
+                }
+                if let Some(ref old_ckpt) = prev_ckpt {
+                    pit_and_log(&new_ckpt, old_ckpt, trainer, config, rng);
+                }
+                prev_ckpt = Some(new_ckpt);
+            }
         }
 
         if let Some(p) = pool {
             p.broadcast_weights(&trainer.vs);
-        }
-
-        if let Some(new_ckpt) = maybe_checkpoint(&trainer.vs, trainer.step, config) {
-            if let Some(ref old_ckpt) = prev_ckpt {
-                pit_and_log(&new_ckpt, old_ckpt, trainer, config, rng);
-            }
-            prev_ckpt = Some(new_ckpt);
         }
 
         if shutdown.load(Ordering::Relaxed) {
@@ -648,6 +656,50 @@ mod tests {
         assert_eq!(t.step, 10);
         assert!(dir.path().join("step_00000005.ot").exists(), "checkpoint at step 5");
         assert!(dir.path().join("step_00000010.ot").exists(), "checkpoint at step 10");
+    }
+
+    #[test]
+    fn test_run_loop_writes_checkpoint_metrics_jsonl_at_boundary() {
+        let mut t = small_trainer();
+        let buf = filled_buffer(t.min_buffer_size());
+        let mut rng = StdRng::seed_from_u64(0);
+        let dir = tempfile::tempdir().unwrap();
+        let metrics_path = dir.path().join("metrics.jsonl");
+        let mut metrics_writer = crate::metrics::JsonlWriter::new(&metrics_path).unwrap();
+        let cfg = OrchestrationConfig {
+            total_steps: 2,
+            steps_per_broadcast: 100,
+            fill_poll_ms: 1,
+            checkpoint_every: 1,
+            checkpoint_dir: dir.path().join("checkpoints").to_str().unwrap().to_string(),
+            pit_games: 0,
+        };
+
+        run_loop(
+            &mut t,
+            buf,
+            None,
+            &cfg,
+            &mut rng,
+            no_shutdown(),
+            Some(&mut metrics_writer),
+        );
+
+        let contents = std::fs::read_to_string(metrics_path).unwrap();
+        let events: Vec<serde_json::Value> = contents
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let checkpoint_events: Vec<_> = events
+            .iter()
+            .filter(|event| event["type"] == "checkpoint")
+            .collect();
+
+        assert_eq!(checkpoint_events.len(), 2, "expected one checkpoint event per checkpoint");
+        assert_eq!(checkpoint_events[0]["step"], 1);
+        assert_eq!(checkpoint_events[1]["step"], 2);
+        assert!(checkpoint_events[0]["path"].as_str().unwrap().ends_with("step_00000001.ot"));
+        assert!(checkpoint_events[0]["wall_time_sec"].as_f64().unwrap() >= 0.0);
     }
 
     // ----- elo_delta -----
