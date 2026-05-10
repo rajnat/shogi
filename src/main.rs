@@ -39,6 +39,15 @@ enum Commands {
         /// Number of parallel self-play worker threads
         #[arg(long, default_value_t = 4)]
         workers: usize,
+        /// Directory to write run outputs into
+        #[arg(long, default_value = "runs/default")]
+        run_dir: String,
+        /// Path to write training metrics JSONL (defaults to <run-dir>/metrics.jsonl)
+        #[arg(long)]
+        metrics_jsonl: Option<PathBuf>,
+        /// Path to write evaluation metrics JSONL (defaults to <run-dir>/eval.jsonl)
+        #[arg(long)]
+        eval_jsonl: Option<PathBuf>,
         /// Directory to write checkpoint files into
         #[arg(long, default_value = "checkpoints")]
         checkpoint_dir: String,
@@ -192,6 +201,59 @@ mod tests {
     }
 
     #[test]
+    fn train_cli_resolves_default_run_output_paths() {
+        let cli = Cli::try_parse_from(["shogi", "train", "--run-dir", "runs/example"])
+            .expect("train CLI should parse run dir");
+
+        let Some(Commands::Train {
+            run_dir,
+            metrics_jsonl,
+            eval_jsonl,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected train command");
+        };
+
+        let (metrics_path, eval_path) =
+            resolve_run_output_paths(&run_dir, metrics_jsonl, eval_jsonl);
+
+        assert_eq!(metrics_path, PathBuf::from("runs/example/metrics.jsonl"));
+        assert_eq!(eval_path, PathBuf::from("runs/example/eval.jsonl"));
+    }
+
+    #[test]
+    fn train_cli_respects_explicit_run_output_paths() {
+        let cli = Cli::try_parse_from([
+            "shogi",
+            "train",
+            "--run-dir",
+            "runs/example",
+            "--metrics-jsonl",
+            "custom/metrics.jsonl",
+            "--eval-jsonl",
+            "custom/eval.jsonl",
+        ])
+        .expect("train CLI should parse explicit run output paths");
+
+        let Some(Commands::Train {
+            run_dir,
+            metrics_jsonl,
+            eval_jsonl,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected train command");
+        };
+
+        let (metrics_path, eval_path) =
+            resolve_run_output_paths(&run_dir, metrics_jsonl, eval_jsonl);
+
+        assert_eq!(metrics_path, PathBuf::from("custom/metrics.jsonl"));
+        assert_eq!(eval_path, PathBuf::from("custom/eval.jsonl"));
+    }
+
+    #[test]
     fn train_cli_parses_selfplay_hyperparameters() {
         let cli = Cli::try_parse_from([
             "shogi",
@@ -257,6 +319,17 @@ mod tests {
     }
 }
 
+fn resolve_run_output_paths(
+    run_dir: &str,
+    metrics_jsonl: Option<PathBuf>,
+    eval_jsonl: Option<PathBuf>,
+) -> (PathBuf, PathBuf) {
+    let run_dir = PathBuf::from(run_dir);
+    let metrics_path = metrics_jsonl.unwrap_or_else(|| run_dir.join("metrics.jsonl"));
+    let eval_path = eval_jsonl.unwrap_or_else(|| run_dir.join("eval.jsonl"));
+    (metrics_path, eval_path)
+}
+
 fn main() {
     let cli = Cli::parse();
     match cli.command.unwrap_or(Commands::Usi) {
@@ -282,6 +355,9 @@ fn main() {
             channels,
             blocks,
             workers,
+            run_dir,
+            metrics_jsonl,
+            eval_jsonl,
             checkpoint_dir,
             checkpoint_every,
             total_steps,
@@ -317,6 +393,10 @@ fn main() {
             use std::sync::Mutex;
 
             let device = nn::device();
+            let (metrics_jsonl_path, eval_jsonl_path) =
+                resolve_run_output_paths(&run_dir, metrics_jsonl, eval_jsonl);
+            std::fs::create_dir_all(&run_dir).expect("failed to create run dir");
+            let _ = (&metrics_jsonl_path, &eval_jsonl_path);
 
             let train_config = TrainConfig {
                 batch_size,
