@@ -63,6 +63,39 @@ enum Commands {
         /// Log training losses every N steps
         #[arg(long, default_value_t = 100)]
         log_every: u64,
+        /// MCTS simulations per self-play move
+        #[arg(long, default_value_t = 800)]
+        sims: u32,
+        /// Move-selection temperature before the temperature drop ply
+        #[arg(long, default_value_t = 1.0)]
+        temperature_high: f32,
+        /// Move-selection temperature after the temperature drop ply
+        #[arg(long, default_value_t = 0.0)]
+        temperature_low: f32,
+        /// Half-move ply at which self-play temperature drops
+        #[arg(long, default_value_t = 30)]
+        temperature_drop_ply: u32,
+        /// Dirichlet alpha for root exploration noise
+        #[arg(long, default_value_t = 0.15)]
+        dirichlet_alpha: f32,
+        /// Fraction of Dirichlet noise mixed into root priors
+        #[arg(long, default_value_t = 0.25)]
+        dirichlet_epsilon: f32,
+        /// PUCT exploration constant
+        #[arg(long, default_value_t = 1.0)]
+        c_puct: f32,
+        /// Resign when root value estimate stays below this threshold
+        #[arg(long, default_value_t = -0.9, allow_hyphen_values = true)]
+        resign_threshold: f32,
+        /// Do not allow resignations before this half-move ply
+        #[arg(long, default_value_t = 30)]
+        resign_min_ply: u32,
+        /// Consecutive below-threshold plies required before resigning
+        #[arg(long, default_value_t = 5)]
+        resign_consecutive: u32,
+        /// Maximum half-moves before a self-play game is declared drawn
+        #[arg(long, default_value_t = 512)]
+        max_moves: usize,
         /// Number of pit games to play after each checkpoint (0 = skip)
         #[arg(long, default_value_t = 100)]
         pit_games: u64,
@@ -147,6 +180,67 @@ mod tests {
         assert_eq!(min_buffer_size, 2048);
         assert_eq!(log_every, 25);
     }
+
+    #[test]
+    fn train_cli_parses_selfplay_hyperparameters() {
+        let cli = Cli::try_parse_from([
+            "shogi",
+            "train",
+            "--sims",
+            "64",
+            "--temperature-high",
+            "1.5",
+            "--temperature-low",
+            "0.1",
+            "--temperature-drop-ply",
+            "20",
+            "--dirichlet-alpha",
+            "0.3",
+            "--dirichlet-epsilon",
+            "0.4",
+            "--c-puct",
+            "2.5",
+            "--resign-threshold",
+            "-0.8",
+            "--resign-min-ply",
+            "12",
+            "--resign-consecutive",
+            "3",
+            "--max-moves",
+            "128",
+        ])
+        .expect("train CLI should parse self-play hyperparameters");
+
+        let Some(Commands::Train {
+            sims,
+            temperature_high,
+            temperature_low,
+            temperature_drop_ply,
+            dirichlet_alpha,
+            dirichlet_epsilon,
+            c_puct,
+            resign_threshold,
+            resign_min_ply,
+            resign_consecutive,
+            max_moves,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected train command");
+        };
+
+        assert_eq!(sims, 64);
+        assert!((temperature_high - 1.5).abs() < f32::EPSILON);
+        assert!((temperature_low - 0.1).abs() < f32::EPSILON);
+        assert_eq!(temperature_drop_ply, 20);
+        assert!((dirichlet_alpha - 0.3).abs() < f32::EPSILON);
+        assert!((dirichlet_epsilon - 0.4).abs() < f32::EPSILON);
+        assert!((c_puct - 2.5).abs() < f32::EPSILON);
+        assert!((resign_threshold - -0.8).abs() < f32::EPSILON);
+        assert_eq!(resign_min_ply, 12);
+        assert_eq!(resign_consecutive, 3);
+        assert_eq!(max_moves, 128);
+    }
 }
 
 fn main() {
@@ -182,6 +276,17 @@ fn main() {
             weight_decay,
             min_buffer_size,
             log_every,
+            sims,
+            temperature_high,
+            temperature_low,
+            temperature_drop_ply,
+            dirichlet_alpha,
+            dirichlet_epsilon,
+            c_puct,
+            resign_threshold,
+            resign_min_ply,
+            resign_consecutive,
+            max_moves,
             pit_games,
             resume,
         } => {
@@ -220,13 +325,27 @@ fn main() {
             })
             .expect("failed to set Ctrl-C handler");
 
+            let selfplay_config = SelfPlayConfig {
+                num_simulations: sims,
+                temperature_high,
+                temperature_drop_ply,
+                temperature_low,
+                resign_threshold,
+                resign_min_ply,
+                resign_consecutive,
+                max_moves,
+                dirichlet_alpha,
+                dirichlet_epsilon,
+                c_puct,
+            };
+
             let pool = if workers > 0 {
                 Some(WorkerPool::spawn(
                     workers,
                     &trainer.vs,
                     channels,
                     blocks,
-                    SelfPlayConfig::default(),
+                    selfplay_config,
                     Arc::clone(&buffer),
                     42,
                 ))
