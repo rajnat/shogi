@@ -41,6 +41,7 @@ from run_experiment import (
     init_wandb,
     upload_run_artifacts,
     _make_plateau_detector,
+    _env_with_libtorch,
 )
 
 
@@ -130,7 +131,10 @@ def main(argv: list[str] | None = None) -> None:
     # Build release binary once up front rather than for each individual run.
     if base_cfg.get("build_release") and not args.dry_run:
         print("Building release binary…")
-        rc = subprocess.run(["cargo", "build", "--release"]).returncode
+        rc = subprocess.run(
+            ["cargo", "build", "--release"],
+            env=_env_with_libtorch(),
+        ).returncode
         if rc != 0:
             print(f"FAILED: cargo build exited {rc}", file=sys.stderr)
             sys.exit(rc)
