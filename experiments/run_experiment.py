@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import json
 import subprocess
 import sys
 import threading
-from io import TextIOWrapper
+import time
 from pathlib import Path
-from typing import TextIO
+from typing import Callable, TextIO
 
 import yaml
 
@@ -93,25 +94,116 @@ def format_command(cmd: list[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Subprocess launch with tee
+# JSONL tailing
+# ---------------------------------------------------------------------------
+
+def _tail_jsonl(
+    path: Path,
+    stop: threading.Event,
+    on_event: Callable[[dict], None],
+) -> None:
+    """Tail *path* and call *on_event* for each complete JSON line.
+
+    Handles:
+    - File not yet existing: polls until it appears.
+    - Partial writes: if readline() returns a line without a trailing newline
+      the writer hasn't flushed yet; we seek back to the last good offset
+      and retry after a short sleep.
+    - Duplicate reads: a monotonically advancing offset prevents re-processing.
+    """
+    fh = None
+    offset = 0
+    try:
+        while not stop.is_set():
+            if fh is None:
+                if not path.exists():
+                    stop.wait(0.25)
+                    continue
+                fh = open(path)
+
+            line = fh.readline()
+
+            if not line:
+                # Genuine EOF — nothing new yet; wait and try again.
+                stop.wait(0.25)
+                continue
+
+            if not line.endswith("\n"):
+                # Partial write: the writer is mid-flush.  Seek back and wait.
+                fh.seek(offset)
+                stop.wait(0.1)
+                continue
+
+            # Complete line: advance offset and dispatch.
+            offset = fh.tell()
+            stripped = line.strip()
+            if stripped:
+                try:
+                    on_event(json.loads(stripped))
+                except json.JSONDecodeError:
+                    pass
+    finally:
+        if fh:
+            fh.close()
+
+
+# Shared print lock so tee threads and tail threads don't interleave lines.
+_print_lock = threading.Lock()
+
+
+def _locked_print(msg: str) -> None:
+    with _print_lock:
+        print(msg, flush=True)
+
+
+def _on_metrics_event(event: dict) -> None:
+    etype = event.get("type")
+    step  = event.get("step", "?")
+    if etype == "train":
+        _locked_print(
+            f"  \033[36m[metrics]\033[0m "
+            f"step={step:>6}  "
+            f"loss={event['total_loss']:.4f}  "
+            f"policy={event['policy_loss']:.4f}  "
+            f"value={event['value_loss']:.4f}  "
+            f"buf={event['buffer_size']}"
+        )
+    elif etype == "checkpoint":
+        _locked_print(
+            f"  \033[33m[ckpt]\033[0m    "
+            f"step={step:>6}  saved → {event.get('path', '')}"
+        )
+
+
+def _on_eval_event(event: dict) -> None:
+    kind = event.get("opponent_kind", "?")
+    step = event.get("step", "?")
+    w, d, l = event["wins"], event["draws"], event["losses"]
+    _locked_print(
+        f"  \033[32m[eval/{kind}]\033[0m "
+        f"step={step:>6}  "
+        f"score={event['score']:.3f} "
+        f"[{event['score_ci_low']:.3f},{event['score_ci_high']:.3f}]  "
+        f"elo={event['elo_delta']:+.1f}  "
+        f"+{w}={d}-{l}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Subprocess launch with tee + tail
 # ---------------------------------------------------------------------------
 
 def _tee(src: TextIO, *dests: TextIO) -> None:
     """Read lines from *src* and write every line to each destination."""
     for line in src:
-        for dest in dests:
-            dest.write(line)
-            dest.flush()
+        with _print_lock:
+            for dest in dests:
+                dest.write(line)
+                dest.flush()
 
 
 def _env_with_libtorch() -> dict[str, str]:
-    """Return os.environ extended with DYLD_LIBRARY_PATH for libtorch on macOS.
-
-    On macOS, debug binaries built with tch-rs don't embed an rpath, so the
-    dynamic linker can't find libtorch unless we point it explicitly.  We
-    probe $LIBTORCH/lib and the tch-rs default (~/.local/lib) in addition to
-    whatever DYLD_LIBRARY_PATH the caller already set.
-    """
+    """Return os.environ extended with DYLD_LIBRARY_PATH for libtorch on macOS."""
     import os
     env = os.environ.copy()
     candidates = [
@@ -120,7 +212,6 @@ def _env_with_libtorch() -> dict[str, str]:
     ]
     if libtorch := os.environ.get("LIBTORCH"):
         candidates.insert(0, str(Path(libtorch) / "lib"))
-
     extra = ":".join(c for c in candidates if Path(c).is_dir())
     if extra:
         existing = env.get("DYLD_LIBRARY_PATH", "")
@@ -129,12 +220,27 @@ def _env_with_libtorch() -> dict[str, str]:
 
 
 def launch(cmd: list[str], run_dir: Path) -> int:
-    """Run *cmd*, tee-ing stdout/stderr to terminal and log files.
+    """Run *cmd*, tee-ing stdout/stderr to logs while tailing JSONL metrics."""
+    stdout_path  = run_dir / "stdout.log"
+    stderr_path  = run_dir / "stderr.log"
+    metrics_path = run_dir / "metrics.jsonl"
+    eval_path    = run_dir / "eval.jsonl"
 
-    Returns the process exit code.
-    """
-    stdout_path = run_dir / "stdout.log"
-    stderr_path = run_dir / "stderr.log"
+    stop = threading.Event()
+
+    # JSONL tail threads — start before the process so we catch the first write.
+    t_metrics_tail = threading.Thread(
+        target=_tail_jsonl,
+        args=(metrics_path, stop, _on_metrics_event),
+        daemon=True,
+    )
+    t_eval_tail = threading.Thread(
+        target=_tail_jsonl,
+        args=(eval_path, stop, _on_eval_event),
+        daemon=True,
+    )
+    t_metrics_tail.start()
+    t_eval_tail.start()
 
     with open(stdout_path, "w") as fout, open(stderr_path, "w") as ferr:
         try:
@@ -143,13 +249,14 @@ def launch(cmd: list[str], run_dir: Path) -> int:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                bufsize=1,  # line-buffered (requires text=True)
+                bufsize=1,
                 env=_env_with_libtorch(),
             )
         except FileNotFoundError:
             msg = f"error: binary not found: {cmd[0]!r}\n"
             sys.stderr.write(msg)
             ferr.write(msg)
+            stop.set()
             return 127
 
         t_out = threading.Thread(
@@ -170,6 +277,12 @@ def launch(cmd: list[str], run_dir: Path) -> int:
             t_err.join()
 
         proc.wait()
+
+    # Give tail threads time to drain any events written just before exit.
+    time.sleep(0.5)
+    stop.set()
+    t_metrics_tail.join(timeout=3)
+    t_eval_tail.join(timeout=3)
 
     return proc.returncode
 
