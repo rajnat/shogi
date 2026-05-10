@@ -5,7 +5,7 @@
 /// pool through `WorkerPool::spawn` / `WorkerPool::join`.
 ///
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
@@ -85,6 +85,10 @@ pub struct WorkerPool {
     handles: Vec<JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
     weight_slots: Vec<WeightSlot>,
+    /// Total completed self-play games across all workers since spawn.
+    games_played: Arc<AtomicU64>,
+    /// Total positions (half-moves) generated across all workers since spawn.
+    positions_generated: Arc<AtomicU64>,
     /// Stored for potential future use (e.g. rebuilding nets on arch change).
     #[allow(dead_code)]
     channels: i64,
@@ -117,6 +121,8 @@ impl WorkerPool {
         assert!(num_workers > 0, "must spawn at least one worker");
         let shutdown = Arc::new(AtomicBool::new(false));
         let config = Arc::new(config);
+        let games_played = Arc::new(AtomicU64::new(0));
+        let positions_generated = Arc::new(AtomicU64::new(0));
 
         let weight_slots: Vec<WeightSlot> = (0..num_workers)
             .map(|_| Arc::new(Mutex::new(None)))
@@ -131,9 +137,11 @@ impl WorkerPool {
                 let buffer = Arc::clone(&buffer);
                 let config = Arc::clone(&config);
                 let slot = Arc::clone(slot);
+                let games = Arc::clone(&games_played);
+                let positions = Arc::clone(&positions_generated);
                 let seed = base_seed.wrapping_add(idx as u64);
                 thread::spawn(move || {
-                    worker_loop(worker_vs, worker_net, config, buffer, shutdown, slot, seed)
+                    worker_loop(worker_vs, worker_net, config, buffer, shutdown, slot, seed, games, positions)
                 })
             })
             .collect();
@@ -142,9 +150,22 @@ impl WorkerPool {
             handles,
             shutdown,
             weight_slots,
+            games_played,
+            positions_generated,
             channels,
             blocks,
         }
+    }
+
+    /// Returns `(games_played, positions_generated)` since the pool was spawned.
+    ///
+    /// Reads are `Relaxed` — values may lag by a few nanoseconds but are always
+    /// monotonically non-decreasing and safe to read from any thread.
+    pub fn counters(&self) -> (u64, u64) {
+        (
+            self.games_played.load(Ordering::Relaxed),
+            self.positions_generated.load(Ordering::Relaxed),
+        )
     }
 
     /// Number of live worker threads.
@@ -166,15 +187,20 @@ impl WorkerPool {
         }
     }
 
-    /// Signal all workers to stop after their current game, then join all threads.
+    /// Signal all workers to stop after their current game, join all threads,
+    /// and return the final `(games_played, positions_generated)` totals.
     ///
     /// Because workers check the shutdown flag *after* each game, every thread
     /// is guaranteed to push at least one completed game before returning.
-    pub fn join(self) {
+    pub fn join(self) -> (u64, u64) {
         self.shutdown.store(true, Ordering::Relaxed);
         for h in self.handles {
             h.join().expect("worker thread panicked");
         }
+        (
+            self.games_played.load(Ordering::Relaxed),
+            self.positions_generated.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -190,6 +216,8 @@ fn worker_loop(
     shutdown: Arc<AtomicBool>,
     slot: WeightSlot,
     seed: u64,
+    games_counter: Arc<AtomicU64>,
+    positions_counter: Arc<AtomicU64>,
 ) {
     let mut rng = StdRng::seed_from_u64(seed);
     loop {
@@ -199,7 +227,10 @@ fn worker_loop(
         }
 
         let result = tch::no_grad(|| play_game(&net, &config, tch::Device::Cpu, &mut rng));
+        let n_positions = result.records.len() as u64;
         buffer.lock().unwrap().push_game(result.records);
+        games_counter.fetch_add(1, Ordering::Relaxed);
+        positions_counter.fetch_add(n_positions, Ordering::Relaxed);
 
         // Check shutdown after the game — guarantees at least one game per worker.
         if shutdown.load(Ordering::Relaxed) {
@@ -442,6 +473,25 @@ mod tests {
         pool.broadcast_weights(&master_vs);
         pool.broadcast_weights(&master_vs); // second call overwrites pending
         pool.join();
+    }
+
+    #[test]
+    fn test_counters_increment_after_one_game() {
+        let (master_vs, _) = make_master();
+        let buffer = test_buffer(10_000);
+        let pool = WorkerPool::spawn(1, &master_vs, 8, 2, tiny_config(), Arc::clone(&buffer), 0);
+        let (games, positions) = pool.join(); // join returns final totals
+        assert!(games >= 1, "expected ≥1 game, got {games}");
+        assert!(positions >= 1, "expected ≥1 position, got {positions}");
+    }
+
+    #[test]
+    fn test_counters_scale_with_workers() {
+        let (master_vs, _) = make_master();
+        let buffer = test_buffer(10_000);
+        let pool = WorkerPool::spawn(3, &master_vs, 8, 2, tiny_config(), Arc::clone(&buffer), 0);
+        let (games, _) = pool.join(); // each worker plays at least one game
+        assert!(games >= 3, "expected ≥3 games from 3 workers, got {games}");
     }
 
     #[test]

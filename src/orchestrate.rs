@@ -348,6 +348,10 @@ pub fn run_loop<R: Rng>(
     // Best checkpoint by anchor score; only tracked when eval_anchor is configured.
     let mut best_ckpt: Option<PathBuf> = None;
     let mut best_score: f64 = -1.0;
+    // Throughput tracking: snapshot at the previous log event for window rates.
+    let mut last_log_wall_sec: f64 = 0.0;
+    let mut last_log_games: u64 = 0;
+    let mut last_log_positions: u64 = 0;
 
     loop {
         for _ in 0..config.steps_per_broadcast {
@@ -361,16 +365,29 @@ pub fn run_loop<R: Rng>(
             if metrics.step == 1 || trainer.should_log(metrics.step) {
                 if let Some(writer) = metrics_writer.as_deref_mut() {
                     let buffer_size = buffer.lock().unwrap().len();
+                    let wall_time_sec = started_at.elapsed().as_secs_f64();
+                    let (total_games, total_positions) =
+                        pool.map_or((0, 0), |p| p.counters());
+                    let dt = (wall_time_sec - last_log_wall_sec).max(1e-9);
+                    let games_per_sec = (total_games - last_log_games) as f64 / dt;
+                    let positions_per_sec = (total_positions - last_log_positions) as f64 / dt;
+                    last_log_wall_sec = wall_time_sec;
+                    last_log_games = total_games;
+                    last_log_positions = total_positions;
                     writer
                         .write(&MetricEvent::Train(TrainEvent {
                             step: metrics.step,
-                            wall_time_sec: started_at.elapsed().as_secs_f64(),
+                            wall_time_sec,
                             total_loss: metrics.total_loss,
                             policy_loss: metrics.policy_loss,
                             value_loss: metrics.value_loss,
                             buffer_size,
                             checkpoint_every: config.checkpoint_every,
                             batch_size: trainer.batch_size(),
+                            selfplay_games: total_games,
+                            selfplay_positions: total_positions,
+                            games_per_sec,
+                            positions_per_sec,
                         }))
                         .expect("failed to write training metrics JSONL");
                 }

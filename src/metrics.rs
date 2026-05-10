@@ -24,6 +24,12 @@ pub struct TrainEvent {
     pub buffer_size: usize,
     pub checkpoint_every: u64,
     pub batch_size: usize,
+    // Self-play throughput counters (cumulative since run start).
+    pub selfplay_games: u64,
+    pub selfplay_positions: u64,
+    // Per-second rates over the window since the previous log event.
+    pub games_per_sec: f64,
+    pub positions_per_sec: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
