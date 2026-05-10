@@ -99,6 +99,9 @@ enum Commands {
         /// Leaf positions batched per neural-net MCTS evaluation
         #[arg(long, default_value_t = 8)]
         mcts_batch_size: usize,
+        /// RNG seed for training and self-play workers
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
         /// Number of pit games to play after each checkpoint (0 = skip)
         #[arg(long, default_value_t = 100)]
         pit_games: u64,
@@ -162,6 +165,8 @@ mod tests {
             "2048",
             "--log-every",
             "25",
+            "--seed",
+            "1234",
         ])
         .expect("train CLI should parse training hyperparameters");
 
@@ -171,6 +176,7 @@ mod tests {
             weight_decay,
             min_buffer_size,
             log_every,
+            seed,
             ..
         }) = cli.command
         else {
@@ -182,6 +188,7 @@ mod tests {
         assert!((weight_decay - 0.00001).abs() < f64::EPSILON);
         assert_eq!(min_buffer_size, 2048);
         assert_eq!(log_every, 25);
+        assert_eq!(seed, 1234);
     }
 
     #[test]
@@ -295,6 +302,7 @@ fn main() {
             resign_consecutive,
             max_moves,
             mcts_batch_size,
+            seed,
             pit_games,
             resume,
         } => {
@@ -356,7 +364,7 @@ fn main() {
                     blocks,
                     selfplay_config,
                     Arc::clone(&buffer),
-                    42,
+                    seed,
                 ))
             } else {
                 None
@@ -371,7 +379,7 @@ fn main() {
                 pit_games,
             };
 
-            let mut rng = StdRng::seed_from_u64(0);
+            let mut rng = StdRng::seed_from_u64(seed);
             run_loop(
                 &mut trainer,
                 buffer,
