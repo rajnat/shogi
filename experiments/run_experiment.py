@@ -238,6 +238,107 @@ def _wb_log_eval(event: dict, run) -> None:
 
 
 # ---------------------------------------------------------------------------
+# W&B artifact upload
+# ---------------------------------------------------------------------------
+
+_LOG_FILES = [
+    "resolved_config.yaml",
+    "command.txt",
+    "metrics.jsonl",
+    "eval.jsonl",
+    "stdout.log",
+    "stderr.log",
+]
+
+
+def _find_best_checkpoint(run_dir: Path) -> Path | None:
+    """Return the path of the best checkpoint inferred from eval.jsonl.
+
+    The last eval event with opponent_kind="best" records the checkpoint that
+    beat the previous best; its new_checkpoint field is the current best.
+    Returns None when no such event exists or the file is absent.
+    """
+    eval_path = run_dir / "eval.jsonl"
+    if not eval_path.exists():
+        return None
+    best: Path | None = None
+    for line in eval_path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+            if event.get("opponent_kind") == "best":
+                candidate = Path(event["new_checkpoint"])
+                if candidate.exists():
+                    best = candidate
+        except (json.JSONDecodeError, KeyError):
+            pass
+    return best
+
+
+def _find_final_checkpoint(run_dir: Path) -> Path | None:
+    """Return the highest-step checkpoint in run_dir/checkpoints/, or None."""
+    ckpt_dir = run_dir / "checkpoints"
+    if not ckpt_dir.exists():
+        return None
+    checkpoints = sorted(ckpt_dir.glob("step_*.ot"))
+    return checkpoints[-1] if checkpoints else None
+
+
+def upload_run_artifacts(run_dir: Path, wb_run, cfg: dict) -> None:
+    """Upload selected run outputs to W&B as artifacts.
+
+    Controlled by wandb.upload_artifacts and wandb.upload_checkpoints in cfg.
+    Does nothing when upload_artifacts is falsy or wb_run is None.
+    """
+    if wb_run is None:
+        return
+    wb = cfg.get("wandb", {})
+    if not wb.get("upload_artifacts", False):
+        return
+
+    import wandb
+
+    # ---- Log files ----
+    log_artifact = wandb.Artifact(
+        name="run-logs",
+        type="run-outputs",
+        description=f"Logs and configs for run '{cfg.get('run_name', 'unknown')}'",
+    )
+    added = 0
+    for fname in _LOG_FILES:
+        path = run_dir / fname
+        if path.exists() and path.stat().st_size > 0:
+            log_artifact.add_file(str(path), name=fname)
+            added += 1
+    if added:
+        wb_run.log_artifact(log_artifact)
+        _locked_print(f"  [wandb] uploaded run-logs artifact ({added} files)")
+
+    # ---- Checkpoints ----
+    upload_ckpts = wb.get("upload_checkpoints", "none")
+    if upload_ckpts == "none":
+        return
+
+    # final checkpoint
+    final = _find_final_checkpoint(run_dir)
+    if final:
+        fa = wandb.Artifact(name="checkpoint-final", type="model")
+        fa.add_file(str(final), name=final.name)
+        wb_run.log_artifact(fa)
+        _locked_print(f"  [wandb] uploaded checkpoint-final → {final.name}")
+
+    # best checkpoint (only if distinct from final)
+    best = _find_best_checkpoint(run_dir)
+    if best and best != final:
+        ba = wandb.Artifact(name="checkpoint-best", type="model")
+        ba.add_file(str(best), name=best.name)
+        wb_run.log_artifact(ba)
+        _locked_print(f"  [wandb] uploaded checkpoint-best → {best.name}")
+
+
+# ---------------------------------------------------------------------------
 # W&B initialisation
 # ---------------------------------------------------------------------------
 
@@ -441,6 +542,7 @@ def main(argv: list[str] | None = None) -> None:
     rc = launch(cmd, run_dir, wb_run=wb_run)
 
     if wb_run is not None:
+        upload_run_artifacts(run_dir, wb_run, cfg)
         wb_run.finish(exit_code=rc)
 
     if rc == 0:

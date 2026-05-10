@@ -11,6 +11,8 @@ wandb:
   entity: null
   mode: online
   tags: [smoke]
+  upload_artifacts: true
+  upload_checkpoints: final_only
 
 train:
   channels: 8
