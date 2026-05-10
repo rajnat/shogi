@@ -5,6 +5,13 @@ seed: 42
 rust_binary: target/release/shogi
 build_release: true
 
+wandb:
+  enabled: true
+  project: shogi-core
+  entity: null
+  mode: online
+  tags: [baseline]
+
 train:
   channels: 64
   blocks: 6

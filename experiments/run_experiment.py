@@ -190,6 +190,51 @@ def _on_eval_event(event: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# W&B initialisation
+# ---------------------------------------------------------------------------
+
+def init_wandb(cfg: dict, run_dir: Path) -> "wandb.sdk.wandb_run.Run | None":
+    """Initialise a W&B run if wandb.enabled is true in *cfg*.
+
+    Returns the run object, or None when W&B is disabled.
+    The run URL and ID are written to *run_dir*/wandb_run.txt for reference.
+    """
+    import os
+
+    wb = cfg.get("wandb", {})
+    if not wb.get("enabled", False):
+        return None
+
+    import wandb  # deferred — not required when disabled
+
+    # WANDB_MODE env var takes precedence over the config value (standard W&B
+    # convention), so honour it here too.
+    effective_mode = os.environ.get("WANDB_MODE") or wb.get("mode", "online")
+
+    # W&B ≥0.18 requires an API key even in offline mode.  Set a placeholder
+    # so offline / CI runs don't error-out prompting for credentials.
+    if effective_mode in ("offline", "disabled") and not os.environ.get("WANDB_API_KEY"):
+        os.environ["WANDB_API_KEY"] = "local-xxx"
+
+    run = wandb.init(
+        project=wb.get("project", "shogi"),
+        entity=wb.get("entity") or None,   # None falls back to personal account
+        name=cfg.get("run_name"),
+        group=cfg.get("group"),
+        tags=wb.get("tags") or [],
+        config=cfg,                         # full resolved config as hyperparams
+        mode=effective_mode,
+        dir=str(run_dir),
+        resume="allow",
+    )
+
+    url = getattr(run, "url", None) or "(offline — sync with `wandb sync`)"
+    print(f"W&B:      {url}")
+    (run_dir / "wandb_run.txt").write_text(f"id:  {run.id}\nurl: {url}\n")
+    return run
+
+
+# ---------------------------------------------------------------------------
 # Subprocess launch with tee + tail
 # ---------------------------------------------------------------------------
 
@@ -329,8 +374,13 @@ def main(argv: list[str] | None = None) -> None:
             print(f"\nFAILED: cargo build exited {rc}", file=sys.stderr)
             sys.exit(rc)
 
+    wb_run = init_wandb(cfg, run_dir)
+
     print("\nLaunching training…\n")
     rc = launch(cmd, run_dir)
+
+    if wb_run is not None:
+        wb_run.finish(exit_code=rc)
 
     if rc == 0:
         print(f"\nDone. Logs → {run_dir}/")
