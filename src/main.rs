@@ -397,6 +397,49 @@ fn main() {
             let (metrics_jsonl_path, eval_jsonl_path) =
                 resolve_run_output_paths(&run_dir, metrics_jsonl, eval_jsonl);
             std::fs::create_dir_all(&run_dir).expect("failed to create run dir");
+
+            {
+                use shogi_core::metrics::{RunConfig, write_run_config};
+                let cfg = RunConfig {
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    unix_timestamp: RunConfig::unix_now(),
+                    channels,
+                    blocks,
+                    workers,
+                    seed,
+                    run_dir: run_dir.clone(),
+                    metrics_jsonl: metrics_jsonl_path.display().to_string(),
+                    eval_jsonl: eval_jsonl_path.display().to_string(),
+                    checkpoint_dir: checkpoint_dir.clone(),
+                    batch_size,
+                    learning_rate,
+                    weight_decay,
+                    min_buffer_size,
+                    log_every,
+                    checkpoint_every,
+                    total_steps,
+                    pit_games,
+                    sims,
+                    temperature_high,
+                    temperature_low,
+                    temperature_drop_ply,
+                    dirichlet_alpha,
+                    dirichlet_epsilon,
+                    c_puct,
+                    resign_threshold,
+                    resign_min_ply,
+                    resign_consecutive,
+                    max_moves,
+                    mcts_batch_size,
+                    resume: resume.as_ref().map(|p| p.display().to_string()),
+                };
+                write_run_config(
+                    &std::path::PathBuf::from(&run_dir).join("run_config.json"),
+                    &cfg,
+                )
+                .expect("failed to write run_config.json");
+            }
+
             let mut metrics_writer = Some(
                 JsonlWriter::new(&metrics_jsonl_path)
                     .expect("failed to create metrics JSONL writer"),
