@@ -1,0 +1,27 @@
+project: shogi-core
+run_name: smoke
+group: smoke
+seed: 42
+rust_binary: target/release/shogi
+build_release: false
+
+train:
+  channels: 8
+  blocks: 2
+  workers: 1
+  sims: 2
+  batch_size: 2
+  min_buffer_size: 2
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  c_puct: 1.0
+  dirichlet_alpha: 0.15
+  dirichlet_epsilon: 0.25
+  temperature_high: 1.0
+  temperature_low: 0.0
+  temperature_drop_ply: 4
+  max_moves: 4
+  total_steps: 2
+  checkpoint_every: 1
+  pit_games: 0
+  log_every: 1

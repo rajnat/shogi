@@ -1,0 +1,27 @@
+project: shogi-core
+run_name: baseline_fast
+group: baseline
+seed: 42
+rust_binary: target/release/shogi
+build_release: true
+
+train:
+  channels: 64
+  blocks: 6
+  workers: 4
+  sims: 100
+  batch_size: 256
+  min_buffer_size: 5000
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  c_puct: 1.0
+  dirichlet_alpha: 0.15
+  dirichlet_epsilon: 0.25
+  temperature_high: 1.0
+  temperature_low: 0.0
+  temperature_drop_ply: 30
+  max_moves: 256
+  total_steps: 10000
+  checkpoint_every: 500
+  pit_games: 20
+  log_every: 50
