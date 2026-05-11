@@ -12,11 +12,16 @@ pub mod checkpoint;
 
 /// Return the device to use for all tensor ops.
 ///
-/// Prefers CUDA if available, otherwise falls back to CPU.  On Apple Silicon
-/// the MPS backend is not exposed through tch-rs, so CPU is the correct
-/// fallback here.
+/// Priority: CUDA > MPS (Apple Silicon) > CPU.
 pub fn device() -> Device {
-    Device::cuda_if_available()
+    if tch::utils::has_cuda() {
+        return Device::Cuda(0);
+    }
+    #[cfg(target_os = "macos")]
+    if tch::utils::has_mps() {
+        return Device::Mps;
+    }
+    Device::Cpu
 }
 
 // ---------------------------------------------------------------------------

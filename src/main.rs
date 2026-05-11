@@ -529,6 +529,7 @@ fn main() {
                     &trainer.vs,
                     channels,
                     blocks,
+                    device,
                     selfplay_config,
                     Arc::clone(&buffer),
                     seed,

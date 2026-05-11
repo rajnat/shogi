@@ -799,6 +799,114 @@ where
     select_move_by_temperature(&a, ROOT, config.temperature, &mut rand::thread_rng())
 }
 
+/// Run `num_simulations` MCTS iterations from `board` using batched neural-network
+/// evaluation.
+///
+/// Unlike `mcts_search_with_evaluator` (one evaluator call per simulation),
+/// this function collects up to `config.batch_size` leaf positions per round and
+/// evaluates them in a single `batch_evaluator` call.  Virtual loss steers each
+/// selection in a round to a distinct leaf.
+///
+/// Returns `(chosen_move, root_value, root_policy_logits)`:
+/// - `chosen_move`: `None` only when the root is terminal (no legal moves).
+/// - `root_value`: the network's value estimate at the root (used for resign detection).
+/// - `root_policy_logits`: raw logits from the root evaluation.
+pub fn mcts_search_batched<R, F>(
+    arena: &mut Arena,
+    board: &mut Board,
+    num_simulations: u32,
+    config: &MctsConfig,
+    rng: &mut R,
+    mut batch_evaluator: F,
+) -> (Option<Move>, f32, Vec<f32>)
+where
+    R: Rng,
+    F: FnMut(&[Board]) -> Vec<super::batch::EvalResult>,
+{
+    arena.clear();
+    let root = arena.alloc(Node::new(None, 1.0, NO_PARENT));
+
+    // Evaluate and expand root; capture value/policy for the caller.
+    let root_result = batch_evaluator(std::slice::from_ref(board))
+        .into_iter()
+        .next()
+        .expect("batch_evaluator returned empty results for root");
+    let root_value = root_result.value;
+    let root_policy_logits = root_result.policy_logits.clone();
+
+    if !expand_with_policy(arena, root, board, &root_result.policy_logits) {
+        return (None, root_value, root_policy_logits);
+    }
+
+    if config.dirichlet_noise {
+        add_dirichlet_noise(arena, root, config.dirichlet_alpha, config.dirichlet_epsilon, rng);
+    }
+
+    let batch_size = config.batch_size.max(1);
+    let mut sims_done = 0u32;
+
+    while sims_done < num_simulations {
+        let this_batch = ((num_simulations - sims_done) as usize).min(batch_size);
+
+        // Phase 1: select `this_batch` leaves; apply VL; capture board at each leaf.
+        // board is restored to the root position after each selection.
+        // Entry: (leaf_node_idx, path_to_root, board_at_leaf)
+        let mut entries: Vec<(NodeIdx, Vec<NodeIdx>, Board)> = Vec::with_capacity(this_batch);
+        for _ in 0..this_batch {
+            let (leaf, undo_stack) = select(arena, root, board, config.c_puct);
+            let path = path_to_root(arena, leaf);
+            apply_virtual_loss(arena, &path);
+            let leaf_board = board.clone();
+            for (mv, undo) in undo_stack.iter().rev() {
+                unmake_move_full(board, *mv, undo);
+            }
+            entries.push((leaf, path, leaf_board));
+        }
+
+        // Phase 2: determine terminal vs non-terminal; collect boards for eval.
+        let mut is_terminal: Vec<bool> = Vec::with_capacity(this_batch);
+        let mut eval_boards: Vec<Board> = Vec::with_capacity(this_batch);
+        for (_, _, leaf_board) in &mut entries {
+            let mut probe = Vec::new();
+            generate_legal_moves(leaf_board, &mut probe);
+            let terminal = probe.is_empty();
+            is_terminal.push(terminal);
+            if !terminal {
+                eval_boards.push(leaf_board.clone());
+            }
+        }
+
+        // Phase 3: evaluate all non-terminal leaves in a single batch.
+        let eval_results = if eval_boards.is_empty() {
+            Vec::new()
+        } else {
+            batch_evaluator(&eval_boards)
+        };
+
+        // Phase 4: expand non-terminal leaves, remove VL, backpropagate.
+        let mut eval_iter = eval_results.into_iter();
+        for (entry, &terminal) in entries.iter_mut().zip(is_terminal.iter()) {
+            let (leaf, path, leaf_board) = entry;
+            let value = if terminal {
+                -1.0
+            } else {
+                let eval = eval_iter
+                    .next()
+                    .expect("eval result missing for non-terminal leaf");
+                expand_with_policy(arena, *leaf, leaf_board, &eval.policy_logits);
+                eval.value
+            };
+            remove_virtual_loss(arena, path);
+            backprop(arena, *leaf, value);
+        }
+
+        sims_done += this_batch as u32;
+    }
+
+    let mv = select_move_by_temperature(arena, root, config.temperature, rng);
+    (mv, root_value, root_policy_logits)
+}
+
 pub fn mcts_search_parallel_with_net(
     board: &Board,
     num_simulations: u32,

@@ -75,15 +75,16 @@ fn apply_snapshot(worker_vs: &nn::VarStore, snapshot: &WeightSnapshot) {
 // Weight copy helper
 // ---------------------------------------------------------------------------
 
-/// Build a fresh `(VarStore, Net)` on CPU and deep-copy all weights from
+/// Build a fresh `(VarStore, Net)` on `device` and deep-copy all weights from
 /// `master_vs`.  The resulting VarStore is fully independent — mutating
 /// `master_vs` afterwards has no effect on the copy.
 pub fn build_worker_net(
     master_vs: &nn::VarStore,
     channels: i64,
     blocks: usize,
+    device: tch::Device,
 ) -> (nn::VarStore, Net) {
-    let (mut worker_vs, worker_net) = build_with_config(tch::Device::Cpu, channels, blocks);
+    let (mut worker_vs, worker_net) = build_with_config(device, channels, blocks);
     worker_vs.copy(master_vs).expect("weight copy failed");
     (worker_vs, worker_net)
 }
@@ -183,6 +184,7 @@ impl WorkerPool {
         master_vs: &nn::VarStore,
         channels: i64,
         blocks: usize,
+        device: tch::Device,
         config: SelfPlayConfig,
         buffer: Arc<Mutex<ReplayBuffer>>,
         base_seed: u64,
@@ -209,7 +211,7 @@ impl WorkerPool {
             .iter()
             .enumerate()
             .map(|(idx, slot)| {
-                let (worker_vs, worker_net) = build_worker_net(master_vs, channels, blocks);
+                let (worker_vs, worker_net) = build_worker_net(master_vs, channels, blocks, device);
                 let shutdown = Arc::clone(&shutdown);
                 let buffer = Arc::clone(&buffer);
                 let config = Arc::clone(&config);
@@ -226,7 +228,7 @@ impl WorkerPool {
                 let seed = base_seed.wrapping_add(idx as u64);
                 thread::spawn(move || {
                     worker_loop(worker_vs, worker_net, config, buffer, shutdown, slot, seed,
-                                games, positions, bw, ww, dr, rs, mmd, ves, pes)
+                                games, positions, bw, ww, dr, rs, mmd, ves, pes, device)
                 })
             })
             .collect();
@@ -333,6 +335,7 @@ fn worker_loop(
     max_move_draws: Arc<AtomicU64>,
     visit_entropy_sum: Arc<AtomicU64>,
     policy_entropy_sum: Arc<AtomicU64>,
+    device: tch::Device,
 ) {
     let mut rng = StdRng::seed_from_u64(seed);
     loop {
@@ -341,7 +344,7 @@ fn worker_loop(
             apply_snapshot(&worker_vs, &snap);
         }
 
-        let result = tch::no_grad(|| play_game(&net, &config, tch::Device::Cpu, &mut rng));
+        let result = tch::no_grad(|| play_game(&net, &config, device, &mut rng));
         let n_positions = result.records.len() as u64;
         buffer.lock().unwrap().push_game(result.records);
 
@@ -427,7 +430,7 @@ mod tests {
     #[test]
     fn test_worker_net_outputs_match_master() {
         let (master_vs, master_net) = make_master();
-        let (_worker_vs, worker_net) = build_worker_net(&master_vs, 8, 2);
+        let (_worker_vs, worker_net) = build_worker_net(&master_vs, 8, 2, Device::Cpu);
 
         let xs = randn_input();
         let (mp, mv) = tch::no_grad(|| master_net.forward_t(&xs, false));
@@ -442,7 +445,7 @@ mod tests {
     #[test]
     fn test_worker_net_is_independent_of_master() {
         let (master_vs, _master_net) = make_master();
-        let (_worker_vs, worker_net) = build_worker_net(&master_vs, 8, 2);
+        let (_worker_vs, worker_net) = build_worker_net(&master_vs, 8, 2, Device::Cpu);
 
         let xs = randn_input();
         let (p_before, _) = tch::no_grad(|| worker_net.forward_t(&xs, false));
@@ -466,7 +469,7 @@ mod tests {
     #[test]
     fn test_worker_policy_shape() {
         let (master_vs, _) = make_master();
-        let (_, worker_net) = build_worker_net(&master_vs, 8, 2);
+        let (_, worker_net) = build_worker_net(&master_vs, 8, 2, Device::Cpu);
         let (p, v) = tch::no_grad(|| worker_net.forward_t(&randn_input(), false));
         assert_eq!(p.size(), vec![1, NUM_ACTIONS as i64]);
         assert_eq!(v.size(), vec![1, 1]);
@@ -477,7 +480,7 @@ mod tests {
     #[test]
     fn test_spawn_correct_count() {
         let (master_vs, _) = make_master();
-        let pool = WorkerPool::spawn(3, &master_vs, 8, 2, tiny_config(), test_buffer(10_000), 0);
+        let pool = WorkerPool::spawn(3, &master_vs, 8, 2, Device::Cpu, tiny_config(), test_buffer(10_000), 0);
         assert_eq!(pool.num_workers(), 3);
         pool.join();
     }
@@ -485,7 +488,7 @@ mod tests {
     #[test]
     fn test_spawn_one_worker() {
         let (master_vs, _) = make_master();
-        let pool = WorkerPool::spawn(1, &master_vs, 8, 2, tiny_config(), test_buffer(10_000), 0);
+        let pool = WorkerPool::spawn(1, &master_vs, 8, 2, Device::Cpu, tiny_config(), test_buffer(10_000), 0);
         assert_eq!(pool.num_workers(), 1);
         pool.join();
     }
@@ -494,14 +497,14 @@ mod tests {
     fn test_join_terminates_all_threads() {
         let (master_vs, _) = make_master();
         // Must return — hanging here means deadlock.
-        WorkerPool::spawn(4, &master_vs, 8, 2, tiny_config(), test_buffer(10_000), 0).join();
+        WorkerPool::spawn(4, &master_vs, 8, 2, Device::Cpu, tiny_config(), test_buffer(10_000), 0).join();
     }
 
     #[test]
     fn test_single_worker_populates_buffer() {
         let (master_vs, _) = make_master();
         let buffer = test_buffer(10_000);
-        let pool = WorkerPool::spawn(1, &master_vs, 8, 2, tiny_config(), Arc::clone(&buffer), 0);
+        let pool = WorkerPool::spawn(1, &master_vs, 8, 2, Device::Cpu, tiny_config(), Arc::clone(&buffer), 0);
         pool.join(); // worker plays exactly one game then exits
         assert!(
             buffer.lock().unwrap().len() > 0,
@@ -513,7 +516,7 @@ mod tests {
     fn test_two_workers_each_push_at_least_one_game() {
         let (master_vs, _) = make_master();
         let buffer = test_buffer(10_000);
-        let pool = WorkerPool::spawn(2, &master_vs, 8, 2, tiny_config(), Arc::clone(&buffer), 0);
+        let pool = WorkerPool::spawn(2, &master_vs, 8, 2, Device::Cpu, tiny_config(), Arc::clone(&buffer), 0);
         pool.join();
         // Each worker plays at least one game; max_moves=20 so each game is ≤20 records.
         // Two workers → at least 2 positions pushed (one game each is guaranteed).
@@ -524,7 +527,7 @@ mod tests {
     fn test_workers_use_different_seeds() {
         let (master_vs, _) = make_master();
         let buffer = test_buffer(10_000);
-        let pool = WorkerPool::spawn(2, &master_vs, 8, 2, tiny_config(), Arc::clone(&buffer), 42);
+        let pool = WorkerPool::spawn(2, &master_vs, 8, 2, Device::Cpu, tiny_config(), Arc::clone(&buffer), 42);
         pool.join();
         assert!(buffer.lock().unwrap().len() >= 2);
     }
@@ -566,7 +569,7 @@ mod tests {
     fn test_apply_snapshot_changes_worker_output() {
         let (master_vs1, _) = make_master();
         let (master_vs2, _) = make_master(); // different random weights
-        let (worker_vs, worker_net) = build_worker_net(&master_vs1, 8, 2);
+        let (worker_vs, worker_net) = build_worker_net(&master_vs1, 8, 2, Device::Cpu);
         let xs = randn_input();
         let (p_before, _) = tch::no_grad(|| worker_net.forward_t(&xs, false));
 
@@ -584,7 +587,7 @@ mod tests {
     fn test_apply_snapshot_matches_source() {
         let (master_vs1, master_net1) = make_master();
         let (master_vs2, master_net2) = make_master();
-        let (worker_vs, worker_net) = build_worker_net(&master_vs1, 8, 2);
+        let (worker_vs, worker_net) = build_worker_net(&master_vs1, 8, 2, Device::Cpu);
 
         apply_snapshot(&worker_vs, &snapshot_vars(&master_vs2));
 
@@ -605,7 +608,7 @@ mod tests {
     #[test]
     fn test_broadcast_does_not_panic() {
         let (master_vs, _) = make_master();
-        let pool = WorkerPool::spawn(2, &master_vs, 8, 2, tiny_config(), test_buffer(10_000), 0);
+        let pool = WorkerPool::spawn(2, &master_vs, 8, 2, Device::Cpu, tiny_config(), test_buffer(10_000), 0);
         pool.broadcast_weights(&master_vs);
         pool.broadcast_weights(&master_vs); // second call overwrites pending
         pool.join();
@@ -615,7 +618,7 @@ mod tests {
     fn test_outcome_counters_sum_to_games() {
         let (master_vs, _) = make_master();
         let buffer = test_buffer(10_000);
-        let pool = WorkerPool::spawn(2, &master_vs, 8, 2, tiny_config(), Arc::clone(&buffer), 0);
+        let pool = WorkerPool::spawn(2, &master_vs, 8, 2, Device::Cpu, tiny_config(), Arc::clone(&buffer), 0);
         let c = pool.join();
         assert_eq!(
             c.black_wins + c.white_wins + c.draws, c.games,
@@ -635,7 +638,7 @@ mod tests {
     fn test_counters_increment_after_one_game() {
         let (master_vs, _) = make_master();
         let buffer = test_buffer(10_000);
-        let pool = WorkerPool::spawn(1, &master_vs, 8, 2, tiny_config(), Arc::clone(&buffer), 0);
+        let pool = WorkerPool::spawn(1, &master_vs, 8, 2, Device::Cpu, tiny_config(), Arc::clone(&buffer), 0);
         let c = pool.join();
         assert!(c.games >= 1, "expected ≥1 game, got {}", c.games);
         assert!(c.positions >= 1, "expected ≥1 position, got {}", c.positions);
@@ -645,7 +648,7 @@ mod tests {
     fn test_counters_scale_with_workers() {
         let (master_vs, _) = make_master();
         let buffer = test_buffer(10_000);
-        let pool = WorkerPool::spawn(3, &master_vs, 8, 2, tiny_config(), Arc::clone(&buffer), 0);
+        let pool = WorkerPool::spawn(3, &master_vs, 8, 2, Device::Cpu, tiny_config(), Arc::clone(&buffer), 0);
         let c = pool.join();
         assert!(c.games >= 3, "expected ≥3 games from 3 workers, got {}", c.games);
     }
@@ -654,7 +657,7 @@ mod tests {
     fn test_broadcast_workers_still_populate_buffer() {
         let (master_vs, _) = make_master();
         let buffer = test_buffer(10_000);
-        let pool = WorkerPool::spawn(2, &master_vs, 8, 2, tiny_config(), Arc::clone(&buffer), 0);
+        let pool = WorkerPool::spawn(2, &master_vs, 8, 2, Device::Cpu, tiny_config(), Arc::clone(&buffer), 0);
         pool.broadcast_weights(&master_vs);
         pool.join();
         assert!(buffer.lock().unwrap().len() > 0);

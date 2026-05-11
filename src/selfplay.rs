@@ -19,13 +19,11 @@
 /// Once `config.resign_min_ply` half-moves have been played, if the network's
 /// value estimate at the root stays below `config.resign_threshold` for
 /// `config.resign_consecutive` consecutive plies, the side to move resigns.
-use std::cell::{Cell, RefCell};
-
 use rand::Rng;
 use tch::{Device, Tensor};
 
 use crate::board::Board;
-use crate::mcts::search::{eval_with_net, mcts_search_with_evaluator};
+use crate::mcts::search::{eval_batch_with_net, mcts_search_batched};
 use crate::mcts::{Arena, MctsConfig, NodeIdx};
 use crate::movegen::generate_legal_moves;
 use crate::moves::make_move_full;
@@ -236,30 +234,14 @@ pub fn play_game(
             ..base_cfg.clone()
         };
 
-        // Use a counter to distinguish the root eval (call 0) from leaf evals
-        // (calls 1…N) inside mcts_search_with_evaluator.  This lets us capture
-        // the network's value estimate and policy at the root without a second
-        // forward pass.
-        let call_count = Cell::new(0u32);
-        let root_value = Cell::new(0.0f32);
-        let root_policy_logits: RefCell<Vec<f32>> = RefCell::new(Vec::new());
-
-        let mv = tch::no_grad(|| {
-            mcts_search_with_evaluator(
+        let (mv, root_value, root_policy_logits) = tch::no_grad(|| {
+            mcts_search_batched(
                 &mut arena,
                 &mut board,
                 config.num_simulations,
                 &cfg,
                 rng,
-                |b| {
-                    let result = eval_with_net(net, device, b);
-                    if call_count.get() == 0 {
-                        root_value.set(result.value);
-                        *root_policy_logits.borrow_mut() = result.policy_logits.clone();
-                    }
-                    call_count.set(call_count.get() + 1);
-                    result
-                },
+                |boards| eval_batch_with_net(net, device, boards),
             )
         });
 
@@ -272,13 +254,13 @@ pub fn play_game(
 
         // Entropy measurements for this ply.
         visit_entropies.push(entropy(&policy));
-        policy_entropies.push(softmax_entropy(&root_policy_logits.borrow()));
+        policy_entropies.push(softmax_entropy(&root_policy_logits));
 
         // Record before applying the move.
         raw.push((encode(&board), policy, board.side_to_move));
 
         // Resign check.
-        let v = root_value.get();
+        let v = root_value;
         if ply >= config.resign_min_ply as usize && v < config.resign_threshold {
             resign_counter += 1;
             if resign_counter >= config.resign_consecutive {
@@ -393,30 +375,21 @@ pub fn play_pit_game(
         } else {
             net_white
         };
-        let call_count = std::cell::Cell::new(0u32);
-        let root_value = std::cell::Cell::new(0.0f32);
 
-        let mv = tch::no_grad(|| {
-            mcts_search_with_evaluator(
+        let (mv, root_value, _) = tch::no_grad(|| {
+            mcts_search_batched(
                 &mut arena,
                 &mut board,
                 config.num_simulations,
                 &base_cfg,
                 rng,
-                |b| {
-                    let result = eval_with_net(net, device, b);
-                    if call_count.get() == 0 {
-                        root_value.set(result.value);
-                    }
-                    call_count.set(call_count.get() + 1);
-                    result
-                },
+                |boards| eval_batch_with_net(net, device, boards),
             )
         });
 
         let Some(chosen_move) = mv else { break };
 
-        let v = root_value.get();
+        let v = root_value;
         if ply >= config.resign_min_ply as usize && v < config.resign_threshold {
             resign_counter += 1;
             if resign_counter >= config.resign_consecutive {
